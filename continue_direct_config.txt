@@ -1,0 +1,23 @@
+name: DirectTGI
+version: 0.0.1
+schema: v1
+
+models:
+  - name: Direct-TGI-Connection
+    provider: openai
+    model: Qwen2.5-Coder-7B-Instruct
+    # Connect directly to TGI container - bypass middleware
+    apiBase: http://localhost:5001/v1
+    apiKey: test
+    
+    roles:
+      - chat
+      - edit
+      - apply
+    
+    defaultCompletionOptions:
+      temperature: 0.3
+      maxTokens: 2048
+    
+    requestOptions:
+      timeout: 30000

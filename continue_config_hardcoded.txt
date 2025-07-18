@@ -1,0 +1,30 @@
+name: LocalAI
+version: 0.0.1  
+schema: v1
+
+models:
+  - name: Local-Qwen-Coder
+    provider: openai
+    model: Qwen2.5-Coder-7B-Instruct
+    apiBase: http://localhost:8000/v1
+    # Just hardcode it for now - we can fix the env var later
+    apiKey: test
+    
+    roles:
+      - chat
+      - edit
+      - apply
+    
+    defaultCompletionOptions:
+      temperature: 0.3
+      maxTokens: 2048
+      contextLength: 32768
+    
+    requestOptions:
+      timeout: 30000
+      verifySsl: false
+
+rules:
+  - You are a helpful coding assistant
+  - Provide practical, working solutions
+  - Keep explanations concise

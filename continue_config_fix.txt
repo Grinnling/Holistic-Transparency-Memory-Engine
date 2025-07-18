@@ -1,0 +1,45 @@
+name: LocalAI
+version: 0.0.1
+schema: v1
+
+models:
+  - name: Qwen2.5-Coder-7B
+    provider: openai
+    model: Qwen2.5-Coder-7B-Instruct
+    apiBase: http://localhost:8000/v1
+    # Try these options in order until one works:
+    
+    # Option 1: Direct environment variable reference (should work)
+    apiKey: ${env:ANTHROPIC_API_KEY}
+    
+    # Option 2: If Option 1 fails, hardcode for testing
+    # apiKey: test
+    
+    roles:
+      - chat
+      - edit
+      - apply
+    
+    defaultCompletionOptions:
+      temperature: 0.3
+      maxTokens: 2048
+    
+    requestOptions:
+      timeout: 30000
+      
+# Alternative model configuration if the above doesn't work
+# Uncomment this and comment out the above model:
+#  - name: Qwen2.5-Coder-7B-Fallback
+#    provider: openai  
+#    model: Qwen2.5-Coder-7B-Instruct
+#    apiBase: http://localhost:8000/v1
+#    apiKey: test  # Hardcoded for testing
+#    roles:
+#      - chat
+#      - edit
+#      - apply
+
+rules:
+  - Keep responses concise and practical
+  - Focus on working solutions
+  - Assume the user knows the basics

@@ -1,0 +1,602 @@
+# 🚀 AI Agent Environment - Operations Runbooks
+
+This document consolidates operational runbooks for managing and maintaining the AI Agent Environment. These runbooks provide step-by-step procedures for common operations, troubleshooting, and maintenance tasks.
+
+**Last Updated:** $(date)  
+**Version:** 1.0  
+**Project Status:** Active Development  
+
+---
+
+## 📑 Table of Contents
+
+1. [🚀 System Setup & Deployment](#-system-setup--deployment)
+2. [🔍 Monitoring & Health Checks](#-monitoring--health-checks)
+3. [🔒 Security Operations](#-security-operations)
+4. [🤖 Agent Management](#-agent-management)
+5. [🐳 Container Operations](#-container-operations)
+6. [💾 Data Management](#-data-management)
+7. [🧪 Testing & Validation](#-testing--validation)
+8. [🚨 Incident Response](#-incident-response)
+9. [🔧 Troubleshooting Guide](#-troubleshooting-guide)
+
+---
+
+## 🚀 System Setup & Deployment
+
+### Initial Environment Setup
+
+**Purpose:** Set up a new AI Agent Environment from scratch  
+**Prerequisites:** Ubuntu 22.04, NVIDIA drivers, Docker, Docker Compose  
+**Estimated Time:** 30-45 minutes  
+
+#### Steps:
+1. **Run Main Setup Script**
+   ```bash
+   cd /path/to/project
+   ./scripts/setup/setup.sh
+   ```
+
+2. **Verify Prerequisites**
+   - Ubuntu 22.04 LTS
+   - NVIDIA drivers installed (`nvidia-smi` working)
+   - Docker and Docker Compose installed
+   - Sufficient disk space (>50GB recommended)
+
+3. **Setup Host Middleware**
+   ```bash
+   ./scripts/setup/setup_host_middleware.sh
+   ```
+
+4. **Configure NVIDIA Container Toolkit**
+   ```bash
+   ./scripts/setup/nvidia_container_setup.sh
+   ```
+
+5. **Start Services**
+   ```bash
+   docker-compose up -d
+   ```
+
+6. **Verify Installation**
+   ```bash
+   ./scripts/monitoring/health_check.sh
+   ```
+
+#### Expected Outcomes:
+- All containers running and healthy
+- APIs responding on ports 8080 (TGI), 8000 (middleware), 7860 (agent-app)
+- NVIDIA GPU accessible in containers
+- No critical errors in health check
+
+#### Rollback Procedure:
+```bash
+docker-compose down
+docker system prune -f
+# Remove project directory if needed
+```
+
+---
+
+### Production Deployment
+
+**Purpose:** Deploy to production environment  
+**Prerequisites:** Staging environment tested, backup procedures in place  
+
+#### Pre-Deployment Checklist:
+- [ ] Staging environment fully tested
+- [ ] Security audit completed
+- [ ] Backup procedures verified
+- [ ] Monitoring systems ready
+- [ ] Rollback plan prepared
+
+#### Deployment Steps:
+1. **Create Deployment Backup**
+   ```bash
+   ./scripts/data/backup_config.sh
+   ```
+
+2. **Update Configuration**
+   - Review and update `.env` file
+   - Update docker-compose.yml for production settings
+   - Configure resource limits
+
+3. **Deploy with Zero Downtime**
+   ```bash
+   docker-compose pull
+   docker-compose up -d --no-deps --build
+   ```
+
+4. **Verify Deployment**
+   ```bash
+   ./scripts/testing/integration_test.sh
+   ./scripts/monitoring/health_check.sh
+   ```
+
+---
+
+## 🔍 Monitoring & Health Checks
+
+### Daily Health Check
+
+**Purpose:** Perform daily system health verification  
+**Schedule:** Every day at 8:00 AM  
+**Duration:** 5-10 minutes  
+
+#### Steps:
+1. **Run Automated Health Check**
+   ```bash
+   ./scripts/monitoring/health_check.sh
+   ```
+
+2. **Review Key Metrics**
+   - System load and memory usage
+   - Disk space availability
+   - GPU temperature and utilization
+   - Container status
+   - API response times
+
+3. **Check Security Status**
+   ```bash
+   ./scripts/security/daily_security_check.sh
+   ```
+
+4. **Review Logs**
+   ```bash
+   docker-compose logs --tail=100
+   tail -f logs/security/daily_security_$(date +%Y%m%d).log
+   ```
+
+#### Alert Conditions:
+- Disk usage > 85%
+- Memory usage > 90%
+- GPU temperature > 80°C
+- Any container unhealthy
+- Failed security checks
+
+---
+
+### Performance Monitoring
+
+**Purpose:** Monitor system performance and identify bottlenecks  
+**Frequency:** Weekly or when performance issues suspected  
+
+#### Steps:
+1. **Run Performance Monitor**
+   ```bash
+   ./scripts/monitoring/performance_monitor.sh
+   ```
+
+2. **GPU-Specific Monitoring**
+   ```bash
+   ./scripts/monitoring/gpu_monitor.sh
+   ```
+
+3. **Analyze Results**
+   - Review CPU and memory trends
+   - Check GPU utilization patterns
+   - Identify resource bottlenecks
+   - Review response time metrics
+
+#### Performance Baselines:
+- TGI response time: < 2 seconds
+- GPU utilization: 70-95% under load
+- Memory usage: < 80% baseline
+- Container startup time: < 30 seconds
+
+---
+
+## 🔒 Security Operations
+
+### Weekly Security Audit
+
+**Purpose:** Comprehensive security assessment  
+**Schedule:** Every Sunday at 2:00 AM  
+**Duration:** 30-60 minutes  
+
+#### Steps:
+1. **Run Full Security Audit**
+   ```bash
+   ./scripts/security/security_audit.sh
+   ```
+
+2. **Review Audit Results**
+   ```bash
+   # Check audit summary
+   cat /path/to/latest/audit/AUDIT_SUMMARY.md
+   
+   # Review recommendations
+   cat /path/to/latest/audit/SECURITY_RECOMMENDATIONS.md
+   ```
+
+3. **Address Critical Findings**
+   - Fix any FAIL status items immediately
+   - Plan remediation for WARN items
+   - Update security documentation
+
+4. **Update Security Measures**
+   - Apply security patches
+   - Update AIDE database if needed
+   - Review firewall rules
+   - Check for failed login attempts
+
+#### Security Incident Response:
+If security issues detected:
+1. Run incident response script: `./scripts/security/incident_response.sh`
+2. Isolate affected systems if needed
+3. Document incident details
+4. Implement immediate fixes
+5. Schedule follow-up security review
+
+---
+
+### MOK and Secure Boot Management
+
+**Purpose:** Manage Machine Owner Keys and Secure Boot  
+**When:** After driver updates or security changes  
+
+#### Steps:
+1. **Check Current Status**
+   ```bash
+   mokutil --sb-state
+   mokutil --list-enrolled
+   ```
+
+2. **Enroll New Keys (if needed)**
+   ```bash
+   sudo mokutil --import /path/to/new/key.der
+   # Reboot and complete MOK enrollment
+   ```
+
+3. **Verify DKMS Modules**
+   ```bash
+   dkms status
+   sudo dkms autoinstall
+   ```
+
+---
+
+## 🤖 Agent Management
+
+### Agent Lifecycle Management
+
+**Purpose:** Manage multi-agent system components  
+**When:** Adding, updating, or troubleshooting agents  
+
+#### Steps:
+1. **List Available Agents**
+   ```bash
+   ./scripts/agents/agent_management.sh list
+   ```
+
+2. **Check Agent Status**
+   ```bash
+   ./scripts/agents/agent_management.sh status <agent_name>
+   ```
+
+3. **Register New Agent**
+   ```bash
+   ./scripts/agents/register_agent.sh <agent_name> <agent_config>
+   ```
+
+4. **Test Agent Functionality**
+   ```bash
+   ./scripts/agents/test_agent.sh <agent_name>
+   ```
+
+5. **Deploy Agent Updates**
+   ```bash
+   ./scripts/agents/deploy_agent.sh <agent_name>
+   ```
+
+#### Agent Health Indicators:
+- All required files present (agent.py, __init__.py)
+- Configuration valid
+- Dependencies satisfied
+- Memory usage within limits
+- Response times acceptable
+
+---
+
+### Agent Troubleshooting
+
+**Common Issues:**
+1. **Agent Not Responding**
+   - Check container logs
+   - Verify network connectivity
+   - Restart agent container
+   - Check resource availability
+
+2. **Memory Issues**
+   - Run memory validation: `./scripts/testing/memory_validation.sh`
+   - Check for memory leaks
+   - Optimize agent memory usage
+   - Scale resources if needed
+
+---
+
+## 🐳 Container Operations
+
+### Container Health Management
+
+**Purpose:** Monitor and maintain container health  
+**Frequency:** As needed or when issues detected  
+
+#### Steps:
+1. **Check Container Health**
+   ```bash
+   ./scripts/docker/container_health.sh
+   ```
+
+2. **Review Container Logs**
+   ```bash
+   docker-compose logs <service_name>
+   docker logs <container_name> --tail=100
+   ```
+
+3. **Restart Unhealthy Containers**
+   ```bash
+   docker-compose restart <service_name>
+   ```
+
+4. **Clean Up Resources**
+   ```bash
+   ./scripts/docker/cleanup_containers.sh
+   ```
+
+#### Container Maintenance:
+- **Weekly:** Update containers (`./scripts/docker/update_containers.sh`)
+- **Monthly:** Clean unused images and volumes
+- **Quarterly:** Review resource limits and scaling
+
+---
+
+## 💾 Data Management
+
+### Backup Operations
+
+**Purpose:** Maintain data integrity and recovery capability  
+**Schedule:** Daily automated, weekly manual verification  
+
+#### Daily Backup:
+```bash
+./scripts/data/backup_config.sh
+```
+
+#### Log Management:
+```bash
+./scripts/data/log_rotation.sh
+```
+
+#### Model Management:
+```bash
+./scripts/data/model_management.sh update
+./scripts/data/model_management.sh backup
+```
+
+#### Backup Verification:
+1. Check backup integrity
+2. Test restore procedures monthly
+3. Verify off-site backup sync
+4. Document recovery procedures
+
+---
+
+## 🧪 Testing & Validation
+
+### Integration Testing
+
+**Purpose:** Verify end-to-end system functionality  
+**When:** After deployments, major changes, or weekly validation  
+
+#### Steps:
+1. **Run Full Integration Tests**
+   ```bash
+   ./scripts/testing/integration_test.sh
+   ```
+
+2. **API Endpoint Testing**
+   ```bash
+   ./scripts/testing/api_test.sh
+   ```
+
+3. **Memory System Validation**
+   ```bash
+   ./scripts/testing/memory_validation.sh
+   ```
+
+#### Test Success Criteria:
+- All API endpoints responding correctly
+- Agent communication functioning
+- Memory operations working
+- No critical errors in logs
+- Performance within acceptable ranges
+
+---
+
+## 🚨 Incident Response
+
+### Security Incident Response
+
+**Purpose:** Respond to security incidents  
+**Trigger:** Security alerts, suspicious activity, failed audits  
+
+#### Immediate Response (0-15 minutes):
+1. **Run Incident Response Script**
+   ```bash
+   ./scripts/security/incident_response.sh
+   ```
+
+2. **Assess Severity**
+   - Critical: System compromise suspected
+   - High: Security controls bypassed
+   - Medium: Unusual activity detected
+   - Low: Minor security deviation
+
+3. **Containment Actions**
+   - Isolate affected systems
+   - Block suspicious network traffic
+   - Preserve evidence
+   - Document timeline
+
+#### Investigation Phase (15 minutes - 4 hours):
+1. **Gather Evidence**
+   - Capture system state: `./scripts/monitoring/capture_state.sh`
+   - Review audit logs
+   - Analyze network traffic
+   - Check file integrity
+
+2. **Root Cause Analysis**
+   - Identify attack vector
+   - Determine scope of impact
+   - Assess data exposure
+   - Timeline reconstruction
+
+#### Recovery Phase:
+1. **Implement Fixes**
+   - Patch vulnerabilities
+   - Update security controls
+   - Restore from clean backups if needed
+   - Reset compromised credentials
+
+2. **Verification**
+   - Run security audit
+   - Test system functionality
+   - Monitor for continued activity
+   - Document lessons learned
+
+---
+
+### System Outage Response
+
+**Purpose:** Restore system availability during outages  
+**Target Recovery Time:** < 30 minutes for critical systems  
+
+#### Response Steps:
+1. **Initial Assessment** (0-5 minutes)
+   ```bash
+   ./scripts/monitoring/health_check.sh
+   docker-compose ps
+   ```
+
+2. **Quick Recovery Attempts** (5-15 minutes)
+   ```bash
+   # Restart failed containers
+   docker-compose restart
+   
+   # Check resource availability
+   df -h
+   free -h
+   nvidia-smi
+   ```
+
+3. **Extended Recovery** (15-30 minutes)
+   ```bash
+   # Full system restart if needed
+   docker-compose down
+   docker-compose up -d
+   
+   # Verify recovery
+   ./scripts/testing/integration_test.sh
+   ```
+
+---
+
+## 🔧 Troubleshooting Guide
+
+### Common Issues and Solutions
+
+#### 1. Container Won't Start
+**Symptoms:** Container exits immediately or fails to start  
+**Diagnosis:**
+```bash
+docker-compose logs <service_name>
+docker inspect <container_name>
+```
+**Solutions:**
+- Check resource availability (disk space, memory)
+- Verify configuration files
+- Check port conflicts
+- Review environment variables
+
+#### 2. GPU Not Accessible in Container
+**Symptoms:** CUDA errors, GPU not visible in container  
+**Diagnosis:**
+```bash
+nvidia-smi
+docker run --rm --gpus all nvidia/cuda:11.8.0-base-ubuntu22.04 nvidia-smi
+```
+**Solutions:**
+```bash
+# Reinstall NVIDIA Container Toolkit
+sudo apt-get update
+sudo apt-get install -y nvidia-container-toolkit
+sudo systemctl restart docker
+```
+
+#### 3. High Memory Usage
+**Symptoms:** System slow, OOM errors  
+**Diagnosis:**
+```bash
+free -h
+docker stats
+./scripts/monitoring/performance_monitor.sh
+```
+**Solutions:**
+- Restart memory-intensive containers
+- Increase swap space
+- Optimize model loading
+- Scale horizontally if needed
+
+#### 4. API Timeouts
+**Symptoms:** Slow response times, timeout errors  
+**Diagnosis:**
+```bash
+curl -w "@curl-format.txt" -o /dev/null -s http://localhost:8080/health
+./scripts/testing/api_test.sh
+```
+**Solutions:**
+- Check GPU utilization
+- Restart TGI container
+- Adjust timeout settings
+- Review model configuration
+
+#### 5. Disk Space Issues
+**Symptoms:** Disk full errors, container crashes  
+**Diagnosis:**
+```bash
+df -h
+du -sh /var/lib/docker/
+docker system df
+```
+**Solutions:**
+```bash
+# Clean up Docker resources
+docker system prune -a
+# Rotate logs
+./scripts/data/log_rotation.sh
+# Clean old debug captures
+find debug_captures/ -type d -mtime +30 -exec rm -rf {} \;
+```
+
+---
+
+## 📞 Emergency Contacts
+
+- **Primary:** Your Name - your.email@domain.com
+- **Network Admin:** Herb - herb@domain.com  
+- **On-Call Rotation:** [Define rotation schedule]
+
+---
+
+## 📚 References
+
+- [Security Documentation Update Plan](./documentation-update-plan.md)
+- [Gradio Implementation Plan](./GRADIO_IMPLEMENTATION_PLAN.md)
+- [UI Design Specifications](./UI_DESIGN.md)
+- [Architecture Documentation](../docs/architecture/)
+- [Security Policies](../docs/security/)
+
+---
+
+**Note:** This document should be updated regularly as the system evolves. Review and update procedures monthly or after significant changes.

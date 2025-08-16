@@ -1,0 +1,276 @@
+Indexing Phase
+Before our RAG system can answer any questions, it needs
+knowledge to draw from. For this, we’ll use a WebBaseLoader to
+pull content directly from Lilian Weng's excellent blog post on
+LLM-powered agents.
+Press enter or click to view image in full size
+Indexing phase (Created by )
+
+import bs4
+from langchain_community.document_loaders import
+WebBaseLoader
+loader = WebBaseLoader(
+web_paths=("https://lilianweng.github.io/posts/2023-06-23-
+agent/",),
+bs_kwargs=dict(
+parse_only=bs4.SoupStrainer(
+class_=("post-content", "post-title", "post-header")
+)
+),
+)
+docs = loader.load()
+The bs_kwargs argument helps us target only the relevant
+HTML tags (post-content, post-title, etc.), cleaning up our
+data from the start.
+Now that we have the document, we face our first challenge.
+Feeding a massive document directly into an LLM is inefficient
+and often impossible due to context window limits.
+This is why chunking is a critical step. We need to break the
+document into smaller, semantically meaningful pieces.
+The RecursiveCharacterTextSplitter is the recommended
+tool for this job because it intelligently tries to keep paragraphs
+and sentences intact.
+from langchain.text_splitter import
+RecursiveCharacterTextSplitter
+text_splitter =
+RecursiveCharacterTextSplitter(chunk_size=1000,
+chunk_overlap=200)
+
+splits = text_splitter.split_documents(docs)
+With chunk_size=1000, we are creating chunks of 1000
+characters, and chunk_overlap=200 ensures there is some
+continuity between them, which helps preserve context.
+Our text is now split, but it’s still just text. To perform similarity
+searches, we need to convert these chunks into numerical
+representations called embeddings. We will then store these
+embeddings in a vector store, which is a specialized database
+designed for efficient searching of vectors.
+The Chroma vector store and OpenAIEmbeddings make this
+incredibly simple. The following line handles both embedding
+and indexing in one go.
+from langchain_community.vectorstores import Chroma
+from langchain_openai import OpenAIEmbeddings
+vectorstore = Chroma.from_documents(
+documents=splits,
+embedding=OpenAIEmbeddings()
+)
+With our knowledge indexed, we are now ready to start asking
+questions.
+
+Advanced Indexing Strategies
+So far, our approach to indexing has been straightforward: split
+documents into chunks and embed them. This works, but it has
+a fundamental limitation.
+Small, focused chunks are great for retrieval accuracy (they
+contain less noise), but they often lack the broader context
+needed for the LLM to generate a comprehensive answer.
+Press enter or click to view image in full size
+Indexing Strategies (Created by )
+Conversely, large chunks provide great context but perform
+poorly in retrieval because their core meaning gets diluted.
+This is the classic “chunk size” dilemma. How can we get the
+best of both worlds?
+The answer lies in more advanced indexing strategies that
+separate the document representation used for retrieval from
+the one used for generation. Let’s dive in.
+Multi-Representation Indexing
+The core idea of Multi-Representation Indexing is simple but
+powerful: instead of embedding the full document chunks, we
+create a smaller, more focused representation of each chunk
+(like a summary) and embed that instead.
+
+Multi Representation Indexing (Created by )
+During retrieval, we search over these concise summaries.
+Once we find the best summary, we use its ID to look up and
+retrieve the full, original document chunk.
+This way, we get the precision of searching over small, dense
+summaries and the rich context of the larger parent documents
+for generation.
+First, we need to load some documents to work with. We’ll grab
+two posts from Lilian Weng’s blog.
+from langchain_community.document_loaders import
+WebBaseLoader
+loader = WebBaseLoader("https://lilianweng.github.io/
+posts/2023-06-23-agent/")
+docs = loader.load()
+loader = WebBaseLoader("https://lilianweng.github.io/
+posts/2024-02-05-human-data-quality/")
+docs.extend(loader.load())
+print(f"Loaded {len(docs)} documents.")
+Loaded 2 documents.
+Next, we’ll create a chain to generate a summary for each of
+these documents.
+import uuid
+summary_chain = (
+{"doc": lambda x: x.page_content}
+
+| ChatPromptTemplate.from_template("Summarize the
+following document:\n\n{doc}")
+| ChatOpenAI(model="gpt-3.5-turbo", max_retries=0)
+| StrOutputParser()
+)
+summaries = summary_chain.batch(docs,
+{"max_concurrency": 5})
+print(summaries[0])
+The document discusses building autonomous agents powered
+by Large
+Language Models (LLMs). It outlines the key components of
+such a system, ...
+Now comes the crucial part. We need a MultiVectorRetriever
+which requires two main components:
+1. A vectorstore to store the embeddings of our summaries.
+2. A docstore (a simple key-value store) to hold the original, full
+documents.
+from langchain.storage import InMemoryByteStore
+from langchain.retrievers.multi_vector import
+MultiVectorRetriever
+from langchain_core.documents import Document
+vectorstore = Chroma(collection_name="summaries",
+embedding_function=OpenAIEmbeddings())
+
+store = InMemoryByteStore()
+id_key = "doc_id"
+retriever = MultiVectorRetriever(
+vectorstore=vectorstore,
+byte_store=store,
+id_key=id_key,
+)
+doc_ids = [str(uuid.uuid4()) for _ in docs]
+summary_docs = [
+Document(page_content=s, metadata={id_key: doc_ids[i]})
+for i, s in enumerate(summaries)
+]
+retriever.vectorstore.add_documents(summary_docs)
+retriever.docstore.mset(list(zip(doc_ids, docs)))
+Our advanced index is now built. Let’s test the retrieval process.
+We’ll ask a question about “Memory in agents” and see what
+happens.
+query = "Memory in agents"
+sub_docs = vectorstore.similarity_search(query, k=1)
+print("--- Result from searching summaries ---")
+print(sub_docs[0].page_content)
+print("\n--- Metadata showing the link to the parent document
+---")
+print(sub_docs[0].metadata)
+
+--- Result from searching summaries ---
+The document discusses the concept of building autonomous
+agents powered by Large Language Models (LLMs) as their core
+controllers. It covers components such as planning, memory,
+and tool use, along with case studies and proof-of-concept
+examples like AutoGPT and GPT-Engineer. Challenges like finite
+context length, planning difficulties, and reliability of natural
+language interfaces are also highlighted. The document
+provides references to related research papers and offers a
+comprehensive overview of LLM-powered autonomous agents.
+--- Metadata showing the link to the parent document ---
+{'doc_id': 'cf31524b-fe6a-4b28-a980-f5687c9460ea'}
+As you can see, the search found the summary that mentions
+“memory.” Now, the MultiVectorRetriever will use the
+doc_id from this summary's metadata to automatically fetch
+the full parent document from the docstore.
+retrieved_docs = retriever.get_relevant_documents(query,
+n_results=1)
+print("\n--- The full document retrieved by the
+MultiVectorRetriever ---")
+print(retrieved_docs[0].page_content[0:500])
+"\n\n\n\n\n\nLLM Powered Autonomous Agents |
+Lil'Log\n\n\n\n\n\n\n\n\n
+\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\ ...."
+This is exactly what we wanted! We searched over concise
+summaries but got back the complete, context-rich document,
+solving the chunk size dilemma.
+Hierarchical Indexing (RAPTOR) Knowledge
+
+Tree
+The Theory: RAPTOR (Recursive Abstractive Processing for
+Tree-Organized Retrieval) takes the multi-representation idea a
+step further. Instead of just one layer of summaries, RAPTOR
+builds a multi-level tree of summaries. It starts by clustering
+small document chunks. It then summarizes each cluster.
+Press enter or click to view image in full size
+RAPTOR (from LangChain Docs)
+Then, it takes these summaries, clusters them, and summarizes
+the new clusters. This process repeats, creating a hierarchy of
+knowledge from fine-grained details to high-level concepts.
+When you query, you can search at different levels of this tree,
+allowing for retrieval that can be as specific or as general as
+needed.
+This is a more advanced technique, and while we won’t
+implement the full algorithm here, you can find a deep dive and
+complete code in the RAPTOR Cookbook. It represents the
+cutting edge of structured indexing.
+
+Token-Level Precision (ColBERT)
+The Theory: Standard embedding models create a single
+vector for an entire chunk of text (this is called a “bag-of-words”
+approach). This can lose a lot of nuance.
+Press enter or click to view image in full size
+Specialized embeddings (Created by )
+ColBERT (Contextualized Late Interaction over BERT)
+offers a more granular approach. It generates a separate,
+context-aware embedding for every single token in the
+document.
+When you make a query, ColBERT also embeds every token in
+your query. Then, instead of comparing one document vector to
+one query vector, it finds the maximum similarity between each
+query token and any document token.
+This “late interaction” allows for a much finer-grained
+understanding of relevance, excelling at keyword-style
+searches.
+We can easily use ColBERT through the RAGatouille library.
+!pip install -U ragatouille
+from ragatouille import RAGPretrainedModel
+
+RAG = RAGPretrainedModel.from_pretrained("colbert-ir/
+colbertv2.0")
+Now, let’s index a Wikipedia page using ColBERT’s unique
+token-level approach.
+import requests
+def get_wikipedia_page(title: str):
+"""A helper function to retrieve content from Wikipedia."""
+URL = "https://en.wikipedia.org/w/api.php"
+params = { "action": "query", "format": "json", "titles": title,
+"prop": "extracts", "explaintext": True }
+headers = {"User-Agent": "MyRAGApp/1.0"}
+response = requests.get(URL, params=params,
+headers=headers)
+data = response.json()
+page = next(iter(data["query"]["pages"].values()))
+return page.get("extract")
+full_document = get_wikipedia_page("Hayao_Miyazaki")
+RAG.index(
+collection=[full_document],
+index_name="Miyazaki-ColBERT",
+max_document_length=180,
+split_documents=True,
+)
+The indexing process is more complex, as it’s creating
+embeddings for every token, but RAGatouille handles it
+seamlessly. Now, let's search our new index.
+results = RAG.search(query="What animation studio did
+Miyazaki found?", k=3)
+
+print(results)
+[{'content': 'In April 1984, ...', 'score': 25.9036, 'rank': 1, ...},
+{'content': 'Hayao Miyazaki ...', 'score': 25.5716, 'rank': 2, ...},
+{'content': 'Glen Keane said ...', 'score': 24.8411, 'rank': 3, ...}]
+The top result directly mentions the founding of Studio Ghibli.
+We can also easily wrap this as a standard LangChain retriever.
+colbert_retriever = RAG.as_langchain_retriever(k=3)
+retrieved_docs = colbert_retriever.invoke("What animation
+studio did Miyazaki found?")
+print(retrieved_docs[0].page_content)
+In April 1984, Miyazaki opened his own office in Suginami Ward,
+naming it Nibariki.
+=== Studio Ghibli ===
+==== Early films (1985–1996) ====
+In June 1985, Miyazaki, Takahata, Tokuma and Suzuki founded
+the animation production company Studio Ghibli, with funding
+from Tokuma Shoten. Studio Ghibli's first film, Laputa: Castle in
+the Sky (1986), employed the same production crew of
+Nausicaä. Miyazaki's designs for the film's setting were inspired
+by Greek architecture and "European urbanistic templates".
+ColBERT provides a powerful, fine-grained alternative to
+traditional vector search, demonstrating that the way we build
+our library is just as important as how we search it.

@@ -7,6 +7,8 @@ import sqlite3
 import json
 import uuid
 import logging
+import numpy as np
+import requests
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
@@ -27,8 +29,36 @@ class EpisodicDatabase:
         
         # Initialize database schema
         self._init_schema()
+
+        # LM Studio embedding configuration
+        self.embedding_url = "http://localhost:1234/v1/embeddings"
+        self.embedding_model = "text-embedding-bge-m3@f16"
+
         logger.info(f"Episodic database initialized at {self.db_path}")
-    
+
+    def _generate_embedding(self, text: str) -> Optional[np.ndarray]:
+        """Generate embedding vector for text using LM Studio"""
+        try:
+            response = requests.post(
+                self.embedding_url,
+                json={"model": self.embedding_model, "input": text},
+                timeout=10
+            )
+            if response.ok:
+                data = response.json()
+                embedding = np.array(data['data'][0]['embedding'], dtype=np.float32)
+                return embedding
+            else:
+                logger.error(f"Embedding generation failed: {response.status_code}")
+                return None
+        except Exception as e:
+            logger.error(f"Error generating embedding: {e}")
+            return None
+
+    def _cosine_similarity(self, a: np.ndarray, b: np.ndarray) -> float:
+        """Calculate cosine similarity between two vectors"""
+        return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
+
     def _init_schema(self):
         """Create database tables and indexes"""
         with self._get_connection() as conn:
@@ -91,7 +121,21 @@ class EpisodicDatabase:
                     VALUES (new.id, new.conversation_id, new.summary, new.full_conversation, new.topics);
                 END
             ''')
-            
+
+            # Embeddings table for semantic search
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS embeddings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    episode_id INTEGER NOT NULL,
+                    embedding BLOB NOT NULL,  -- Store as numpy array bytes
+                    embedding_model TEXT NOT NULL,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (episode_id) REFERENCES episodes(id) ON DELETE CASCADE
+                )
+            ''')
+
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_episode_id ON embeddings(episode_id)')
+
             conn.commit()
     
     @contextmanager
@@ -108,6 +152,7 @@ class EpisodicDatabase:
             conn.execute('PRAGMA foreign_keys = ON')
             conn.execute('PRAGMA journal_mode = WAL')
             yield conn
+            conn.commit()  # Commit transaction on success
         except Exception as e:
             if conn:
                 conn.rollback()
@@ -172,8 +217,37 @@ class EpisodicDatabase:
                     participants_json, exchange_count, summary,
                     full_conversation_json, topics_json, trigger_reason
                 ))
+
+                # Get the episode_id we just inserted
+                episode_id = conn.execute(
+                    "SELECT id FROM episodes WHERE conversation_id = ?",
+                    (conversation_id,)
+                ).fetchone()[0]
+
+                # Generate and store embedding for semantic search
+                # Embed FULL exchanges (user input + assistant response) for better recall
+                # This allows matching both questions about topics AND answers with information
+                exchange_texts = []
+                for ex in exchanges:
+                    user_part = ex.get('user_input', ex.get('user_message', ''))
+                    assistant_part = ex.get('assistant_response', ex.get('assistant', ''))
+                    if user_part or assistant_part:
+                        exchange_texts.append(f"{user_part} {assistant_part}")
+
+                text_to_embed = " ".join(exchange_texts)
+                embedding = self._generate_embedding(text_to_embed)
+
+                if embedding is not None:
+                    # Store embedding as bytes
+                    embedding_bytes = embedding.tobytes()
+                    conn.execute('''
+                        INSERT INTO embeddings (episode_id, embedding, embedding_model)
+                        VALUES (?, ?, ?)
+                    ''', (episode_id, embedding_bytes, self.embedding_model))
+                    logger.debug(f"Generated embedding for episode {conversation_id}")
+
                 conn.commit()
-            
+
             logger.info(f"Stored episode {conversation_id} with {exchange_count} exchanges")
             return conversation_id
             
@@ -246,6 +320,10 @@ class EpisodicDatabase:
             
             # Build base query
             if query:
+                # Sanitize query for FTS5 - remove special characters that cause syntax errors
+                # FTS5 special chars: " * ( ) [ ] < > ! - + ?
+                sanitized_query = query.replace('"', '').replace('?', '').replace('*', '').replace('!', '')
+
                 # Use full-text search
                 base_query = '''
                     SELECT episodes.* FROM episodes
@@ -253,7 +331,7 @@ class EpisodicDatabase:
                     WHERE episodes_fts MATCH ?
                 '''
                 # Don't add to conditions again, already in WHERE clause
-                params.append(query)
+                params.append(sanitized_query)
             else:
                 base_query = 'SELECT * FROM episodes WHERE 1=1'
             
@@ -302,6 +380,137 @@ class EpisodicDatabase:
             logger.error(f"Error searching episodes: {e}")
             raise
     
+    def semantic_search(
+        self,
+        query: str,
+        limit: int = 10
+    ) -> List[Tuple[Dict, float]]:
+        """
+        Search episodes using semantic similarity with embeddings
+
+        Args:
+            query: Search query text
+            limit: Maximum results to return
+
+        Returns:
+            List of (episode_dict, similarity_score) tuples, ranked by similarity
+        """
+        try:
+            # Generate embedding for the query
+            query_embedding = self._generate_embedding(query)
+            if query_embedding is None:
+                logger.warning("Failed to generate query embedding, returning empty results")
+                return []
+
+            with self._get_connection() as conn:
+                # Load all embeddings from database
+                rows = conn.execute('''
+                    SELECT e.episode_id, e.embedding, ep.*
+                    FROM embeddings e
+                    JOIN episodes ep ON e.episode_id = ep.id
+                ''').fetchall()
+
+                if not rows:
+                    return []
+
+                # Calculate similarity scores
+                results = []
+                for row in rows:
+                    # Reconstruct numpy array from bytes
+                    stored_embedding = np.frombuffer(row['embedding'], dtype=np.float32)
+
+                    # Calculate cosine similarity
+                    similarity = self._cosine_similarity(query_embedding, stored_embedding)
+
+                    # Convert row to episode dict
+                    episode = self._row_to_dict(row)
+
+                    results.append((episode, float(similarity)))
+
+                # Sort by similarity (highest first) and limit results
+                results.sort(key=lambda x: x[1], reverse=True)
+                return results[:limit]
+
+        except Exception as e:
+            logger.error(f"Error in semantic search: {e}")
+            return []
+
+    def hybrid_search(
+        self,
+        query: str,
+        participants: Optional[List[str]] = None,
+        start_date: Optional[datetime] = None,
+        end_date: Optional[datetime] = None,
+        topics: Optional[List[str]] = None,
+        trigger_reason: Optional[str] = None,
+        limit: int = 10
+    ) -> List[Dict]:
+        """
+        Hybrid search combining FTS5 keyword search and semantic similarity
+
+        Args:
+            query: Search query text
+            participants: Filter by participants
+            start_date: Episodes after this date
+            end_date: Episodes before this date
+            topics: Filter by topics
+            trigger_reason: Filter by trigger reason
+            limit: Maximum results to return
+
+        Returns:
+            List of matching episodes (deduplicated and merged from both methods)
+        """
+        try:
+            # Run both searches in parallel concepts (sequential execution is fine for now)
+            fts_results = self.search_episodes(
+                query=query,
+                participants=participants,
+                start_date=start_date,
+                end_date=end_date,
+                topics=topics,
+                trigger_reason=trigger_reason,
+                limit=limit * 2  # Get more results for better merging
+            )
+
+            semantic_results = self.semantic_search(query, limit=limit * 2)
+
+            # Merge and dedupe by conversation_id
+            seen_ids = set()
+            merged_results = []
+
+            # Add semantic results first (they're already sorted by similarity)
+            for episode, similarity in semantic_results:
+                conv_id = episode['conversation_id']
+                if conv_id not in seen_ids:
+                    seen_ids.add(conv_id)
+                    # Add similarity score to episode for debugging
+                    episode['_semantic_score'] = similarity
+                    merged_results.append(episode)
+
+            # Add FTS results that weren't already included
+            for episode in fts_results:
+                conv_id = episode['conversation_id']
+                if conv_id not in seen_ids:
+                    seen_ids.add(conv_id)
+                    episode['_fts_match'] = True
+                    merged_results.append(episode)
+
+            # Return top N results
+            return merged_results[:limit]
+
+        except Exception as e:
+            logger.error(f"Error in hybrid search: {e}")
+            # Fallback to FTS search
+            return self.search_episodes(
+                query=query,
+                participants=participants,
+                start_date=start_date,
+                end_date=end_date,
+                topics=topics,
+                trigger_reason=trigger_reason,
+                limit=limit
+            )
+
     def get_recent_episodes(self, limit: int = 10) -> List[Dict]:
         """Get the most recent episodes"""
         return self.search_episodes(limit=limit)
@@ -399,23 +608,28 @@ class EpisodicDatabase:
     def _row_to_dict(self, row: sqlite3.Row) -> Dict:
         """Convert database row to dictionary with JSON parsing"""
         episode = dict(row)
-        
+
+        # Remove non-JSON-serializable fields (embeddings, etc.)
+        episode.pop('embedding', None)  # Remove embedding BLOB if present
+        episode.pop('episode_id', None)  # Remove duplicate episode_id from JOIN
+        episode.pop('embedding_model', None)  # Remove embedding model metadata
+
         # Parse JSON fields
         try:
             episode['participants'] = json.loads(episode['participants'])
         except (json.JSONDecodeError, TypeError):
             episode['participants'] = []
-        
+
         try:
             episode['full_conversation'] = json.loads(episode['full_conversation'])
         except (json.JSONDecodeError, TypeError):
             episode['full_conversation'] = []
-        
+
         try:
             episode['topics'] = json.loads(episode['topics'])
         except (json.JSONDecodeError, TypeError):
             episode['topics'] = []
-        
+
         return episode
     
     def export_episode_text(self, conversation_id: str) -> Optional[str]:

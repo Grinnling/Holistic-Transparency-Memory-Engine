@@ -32,7 +32,7 @@ class EpisodicMemoryService:
     Manages long-term storage and retrieval of conversation episodes
     """
     
-    def __init__(self, db_path: str = "/tmp/episodic_memory.db"):
+    def __init__(self, db_path: str = "/home/grinnling/Development/CODE_IMPLEMENTATION/data/episodic_memory.db"):
         """Initialize the episodic memory service"""
         self.service_id = str(uuid.uuid4())
         self.start_time = datetime.now(timezone.utc)
@@ -205,36 +205,48 @@ class EpisodicMemoryService:
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
         topics: Optional[List[str]] = None,
-        limit: int = 20
+        limit: int = 20,
+        use_semantic: bool = True
     ) -> List[Dict]:
-        """Search for conversations"""
+        """Search for conversations using hybrid search (FTS5 + semantic embeddings)"""
         try:
             # Parse date strings
             start_dt = None
             end_dt = None
-            
+
             if start_date:
                 start_dt = self._parse_timestamp(start_date)
             if end_date:
                 end_dt = self._parse_timestamp(end_date)
-            
-            # Perform search
-            results = self.database.search_episodes(
-                query=query,
-                participants=participants,
-                start_date=start_dt,
-                end_date=end_dt,
-                topics=topics,
-                limit=limit
-            )
-            
+
+            # Use hybrid search if query is provided and semantic search is enabled
+            if query and use_semantic:
+                results = self.database.hybrid_search(
+                    query=query,
+                    participants=participants,
+                    start_date=start_dt,
+                    end_date=end_dt,
+                    topics=topics,
+                    limit=limit
+                )
+            else:
+                # Fallback to FTS5-only search
+                results = self.database.search_episodes(
+                    query=query,
+                    participants=participants,
+                    start_date=start_dt,
+                    end_date=end_dt,
+                    topics=topics,
+                    limit=limit
+                )
+
             # Update statistics
             with self.lock:
                 self.stats['searches_performed'] += 1
                 self.stats['episodes_retrieved'] += len(results)
-            
+
             return results
-            
+
         except Exception as e:
             logger.error(f"Error searching conversations: {e}")
             raise
@@ -300,7 +312,7 @@ class EpisodicMemoryService:
 
 # Global service instance
 episodic_service = EpisodicMemoryService(
-    db_path=os.getenv('EPISODIC_DB_PATH', '/tmp/episodic_memory.db')
+    db_path=os.getenv('EPISODIC_DB_PATH', '/home/grinnling/Development/CODE_IMPLEMENTATION/data/episodic_memory.db')
 )
 
 # Request ID middleware
@@ -506,4 +518,4 @@ def get_service_stats():
 if __name__ == '__main__':
     port = int(os.environ.get('EPISODIC_PORT', 8005))
     logger.info(f"Starting Episodic Memory service on port {port}")
-    app.run(host='0.0.0.0', port=port, debug=True)
+    app.run(host='0.0.0.0', port=port, debug=False)

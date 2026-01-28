@@ -1,12 +1,12 @@
 // components/ErrorPanel.tsx
 // This gives Claude what he needs to be more effective!
 
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 import { Card, CardContent, CardHeader, CardTitle } from './ui/card';
 import { Badge } from './ui/badge';
 import { Button } from './ui/button';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from './ui/collapsible';
-import { ChevronDown, Copy, X, AlertTriangle, Info, AlertCircle, Bug } from 'lucide-react';
+import { ChevronDown, ChevronRight, Copy, X, AlertTriangle, Info, AlertCircle, Bug, ChevronsUpDown } from 'lucide-react';
 
 interface ErrorEvent {
   id: string;
@@ -35,7 +35,7 @@ const ErrorPanel: React.FC<ErrorPanelProps> = ({
 }) => {
   console.log('DEBUG: ErrorPanel rendering with', errors.length, 'errors');
   const [filter, setFilter] = useState<'all' | 'critical' | 'warning' | 'normal' | 'debug'>('all');
-  const [expandedErrors, setExpandedErrors] = useState<Set<string>>(new Set());
+  const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
   const [searchTerm, setSearchTerm] = useState('');
 
   // Group similar errors
@@ -77,21 +77,23 @@ const ErrorPanel: React.FC<ErrorPanelProps> = ({
     return filtered;
   }, [groupedErrors, filter, searchTerm]);
 
+  // Color scheme: grey=ok/info, blue=warning/suspicious, red=critical/bad
   const getSeverityIcon = (severity: string) => {
     switch (severity) {
-      case 'critical': return <AlertCircle className="h-4 w-4 text-red-500" />;
-      case 'warning': return <AlertTriangle className="h-4 w-4 text-yellow-500" />;
-      case 'debug': return <Bug className="h-4 w-4 text-gray-500" />;
-      default: return <Info className="h-4 w-4 text-blue-500" />;
+      case 'critical': return <AlertCircle className="h-4 w-4 text-red-400" />;   // Red = bad
+      case 'warning': return <AlertTriangle className="h-4 w-4 text-blue-400" />; // Blue = suspicious
+      case 'debug': return <Bug className="h-4 w-4 text-gray-400" />;             // Grey = info
+      default: return <Info className="h-4 w-4 text-gray-400" />;                 // Grey = info
     }
   };
 
+  // Dark theme colors: grey=ok/info, blue=warning/suspicious, red=critical/bad
   const getSeverityColor = (severity: string) => {
     switch (severity) {
-      case 'critical': return 'bg-red-100 text-red-800 border-red-200';
-      case 'warning': return 'bg-yellow-100 text-yellow-800 border-yellow-200';
-      case 'debug': return 'bg-gray-100 text-gray-800 border-gray-200';
-      default: return 'bg-blue-100 text-blue-800 border-blue-200';
+      case 'critical': return 'bg-red-900/50 text-red-200 border-red-800';        // Red = bad
+      case 'warning': return 'bg-blue-900/50 text-blue-200 border-blue-800';      // Blue = suspicious
+      case 'debug': return 'bg-gray-800 text-gray-300 border-gray-700';           // Grey = info
+      default: return 'bg-gray-700 text-gray-200 border-gray-600';                // Grey = info
     }
   };
 
@@ -111,14 +113,31 @@ Fix Success: ${error.fix_success ?? 'Unknown'}`;
     });
   };
 
-  const toggleExpanded = (errorId: string) => {
-    const newExpanded = new Set(expandedErrors);
-    if (newExpanded.has(errorId)) {
-      newExpanded.delete(errorId);
-    } else {
-      newExpanded.add(errorId);
-    }
-    setExpandedErrors(newExpanded);
+  const toggleGroup = (groupKey: string) => {
+    setExpandedGroups(prev => {
+      const next = new Set(prev);
+      if (next.has(groupKey)) {
+        next.delete(groupKey);
+      } else {
+        next.add(groupKey);
+      }
+      return next;
+    });
+  };
+
+  const expandAll = () => {
+    setExpandedGroups(new Set(Object.keys(filteredGroups)));
+  };
+
+  const collapseAll = () => {
+    setExpandedGroups(new Set());
+  };
+
+  const expandCriticals = () => {
+    const criticalKeys = Object.entries(filteredGroups)
+      .filter(([_, errors]) => errors.some(e => e.severity === 'critical'))
+      .map(([key]) => key);
+    setExpandedGroups(prev => new Set([...prev, ...criticalKeys]));
   };
 
   const criticalCount = errors.filter(e => e.severity === 'critical').length;
@@ -143,6 +162,18 @@ Fix Success: ${error.fix_success ?? 'Unknown'}`;
           </CardTitle>
           
           <div className="flex gap-2">
+            {criticalCount > 0 && (
+              <Button variant="outline" size="sm" onClick={expandCriticals} title="Expand critical errors">
+                <AlertCircle className="h-4 w-4 mr-1" />
+                Expand Criticals
+              </Button>
+            )}
+            <Button variant="ghost" size="sm" onClick={expandAll} title="Expand all">
+              <ChevronsUpDown className="h-4 w-4" />
+            </Button>
+            <Button variant="ghost" size="sm" onClick={collapseAll} title="Collapse all">
+              <ChevronRight className="h-4 w-4" />
+            </Button>
             <Button variant="outline" size="sm" onClick={onClear}>
               Clear All
             </Button>
@@ -150,26 +181,27 @@ Fix Success: ${error.fix_success ?? 'Unknown'}`;
         </div>
         
         {/* Filters */}
-        <div className="flex gap-2 items-center flex-wrap">
-          <div className="flex gap-1">
+        <div className="space-y-2">
+          <div className="flex gap-1 w-full">
             {['all', 'critical', 'warning', 'normal', 'debug'].map((severityFilter) => (
               <Button
                 key={severityFilter}
                 variant={filter === severityFilter ? "default" : "outline"}
                 size="sm"
+                className="flex-1 text-xs"
                 onClick={() => setFilter(severityFilter as any)}
               >
                 {severityFilter}
               </Button>
             ))}
           </div>
-          
+
           <input
             type="text"
             placeholder="Search errors..."
             value={searchTerm}
             onChange={(e) => setSearchTerm(e.target.value)}
-            className="px-3 py-1 border rounded text-sm flex-1 min-w-32"
+            className="w-full px-3 py-1.5 border border-gray-600 rounded text-sm bg-gray-800 text-gray-200 placeholder-gray-500"
           />
         </div>
       </CardHeader>
@@ -180,12 +212,18 @@ Fix Success: ${error.fix_success ?? 'Unknown'}`;
             {errors.length === 0 ? "No errors detected! 🎉" : "No errors match your filters"}
           </div>
         ) : (
-          Object.entries(filteredGroups).map(([groupKey, errorList]) => (
+          Object.entries(filteredGroups).map(([groupKey, errorList]) => {
+            const isExpanded = expandedGroups.has(groupKey);
+            return (
             <div key={groupKey} className="border rounded-lg">
-              <Collapsible>
+              <Collapsible open={isExpanded} onOpenChange={() => toggleGroup(groupKey)}>
                 <CollapsibleTrigger asChild>
                   <div className="flex items-center gap-2 p-3 hover:bg-gray-50 cursor-pointer">
-                    <ChevronDown className="h-4 w-4" />
+                    {isExpanded ? (
+                      <ChevronDown className="h-4 w-4 transition-transform" />
+                    ) : (
+                      <ChevronRight className="h-4 w-4 transition-transform" />
+                    )}
                     {getSeverityIcon(errorList[0].severity)}
                     <span className="flex-1 text-sm font-medium">{groupKey}</span>
                     <Badge variant="secondary">{errorList.length}</Badge>
@@ -276,7 +314,8 @@ Fix Success: ${error.fix_success ?? 'Unknown'}`;
                 </CollapsibleContent>
               </Collapsible>
             </div>
-          ))
+            );
+          })
         )}
       </CardContent>
     </Card>

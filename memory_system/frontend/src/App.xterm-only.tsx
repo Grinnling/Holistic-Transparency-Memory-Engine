@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import { useState } from 'react';
 import { TerminalDisplay } from './components/TerminalDisplay';
 
 function App() {

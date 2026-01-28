@@ -4,11 +4,16 @@ LLM Connector - Flexible integration with TGI or LM Studio
 Connects your memory system to actual LLM inference
 """
 
+import os
 import requests
 import json
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, TYPE_CHECKING
 from enum import Enum
+
+# Conditional import for error handler (avoid circular imports)
+if TYPE_CHECKING:
+    from error_handler import ErrorHandler
 
 class LLMProvider(Enum):
     TGI = "tgi"
@@ -16,24 +21,25 @@ class LLMProvider(Enum):
     OLLAMA = "ollama"
 
 class LLMConnector:
-    def __init__(self, provider: LLMProvider = LLMProvider.LMSTUDIO, debug_mode: bool = False):
+    def __init__(self, provider: LLMProvider = LLMProvider.LMSTUDIO, debug_mode: bool = False, error_handler: Optional["ErrorHandler"] = None):
         self.provider = provider
         self.debug_mode = debug_mode
+        self.error_handler = error_handler
         
-        # Configuration for different providers
+        # Configuration for different providers - uses environment variables with defaults
         self.configs = {
             LLMProvider.TGI: {
-                'base_url': 'http://localhost:8080',
+                'base_url': os.environ.get('TEXTGEN_URL', 'http://localhost:8080'),
                 'endpoint': '/generate',
                 'timeout': 300  # Increased for longer prompts
             },
             LLMProvider.LMSTUDIO: {
-                'base_url': 'http://localhost:1234',
+                'base_url': os.environ.get('LMSTUDIO_URL', 'http://localhost:1234'),
                 'endpoint': '/v1/chat/completions',
                 'timeout': 300  # Increased for longer prompts
             },
             LLMProvider.OLLAMA: {
-                'base_url': 'http://localhost:11434',
+                'base_url': os.environ.get('OLLAMA_URL', 'http://localhost:11434'),
                 'endpoint': '/api/generate',
                 'timeout': 300  # Increased for longer prompts
             }
@@ -41,7 +47,29 @@ class LLMConnector:
         
         self.config = self.configs[provider]
         self.is_connected = False
-        
+
+    def _log_error(self, error: Exception, context: str, operation: str):
+        """Route error through error_handler if available, otherwise print"""
+        if self.error_handler:
+            # Import here to avoid circular imports at module level
+            from error_handler import ErrorCategory, ErrorSeverity
+            self.error_handler.handle_error(
+                error,
+                ErrorCategory.LLM_CONNECTION,
+                ErrorSeverity.MEDIUM_ALERT,
+                context=context,
+                operation=operation
+            )
+        else:
+            # Fallback for standalone testing
+            print(f"❌ [{operation}] {context}: {error}")
+
+    def _log_info(self, message: str):
+        """Log info message - print for now, could route to handler later"""
+        # Info messages are less critical, just print them
+        # Could add info routing to error_handler if needed
+        print(message)
+
     def test_connection(self) -> bool:
         """Test if LLM service is accessible"""
         try:
@@ -55,11 +83,11 @@ class LLMConnector:
                 if self.is_connected:
                     models = response.json().get('data', [])
                     if models:
-                        print(f"✅ LM Studio connected - Model: {models[0].get('id', 'unknown')}")
+                        self._log_info(f"✅ LM Studio connected - Model: {models[0].get('id', 'unknown')}")
                     else:
-                        print("⚠️  LM Studio connected but no model loaded")
+                        self._log_info("⚠️  LM Studio connected but no model loaded")
                         self.is_connected = False
-                        
+
             elif self.provider == LLMProvider.TGI:
                 # TGI has a health endpoint
                 response = requests.get(
@@ -68,8 +96,8 @@ class LLMConnector:
                 )
                 self.is_connected = response.status_code == 200
                 if self.is_connected:
-                    print("✅ TGI connected")
-                    
+                    self._log_info("✅ TGI connected")
+
             elif self.provider == LLMProvider.OLLAMA:
                 # Ollama has a version endpoint
                 response = requests.get(
@@ -78,10 +106,14 @@ class LLMConnector:
                 )
                 self.is_connected = response.status_code == 200
                 if self.is_connected:
-                    print("✅ Ollama connected")
-                    
+                    self._log_info("✅ Ollama connected")
+
         except requests.exceptions.RequestException as e:
-            print(f"❌ {self.provider.value} not accessible: {e}")
+            self._log_error(
+                e,
+                context=f"{self.provider.value} not accessible",
+                operation="test_connection"
+            )
             self.is_connected = False
             
         return self.is_connected
@@ -107,7 +139,11 @@ class LLMConnector:
                 return self._generate_ollama(user_message, conversation_history, system_prompt, skinflap_detection, relevant_memories)
 
         except Exception as e:
-            print(f"Error generating response: {e}")
+            self._log_error(
+                e,
+                context=f"Generating response for: {user_message[:50]}...",
+                operation="generate_response"
+            )
             return f"Error connecting to {self.provider.value}: {str(e)}"
     
     def _generate_lmstudio(self, user_message: str, conversation_history: List[Dict], system_prompt: str, skinflap_detection: Dict = None, relevant_memories: List[Dict] = None) -> str:
@@ -187,8 +223,9 @@ Instructions:
             memory_context_parts.append("---")
 
             memory_context_str = "\n".join(memory_context_parts)
-            print(f"DEBUG [llm_connector]: Injecting {len(relevant_memories)} memories into prompt")
-            print(f"DEBUG [llm_connector]: Memory context preview: {memory_context_str[:200]}...")
+            if self.debug_mode:
+                print(f"DEBUG [llm_connector]: Injecting {len(relevant_memories)} memories into prompt")
+                print(f"DEBUG [llm_connector]: Memory context preview: {memory_context_str[:200]}...")
 
             # Add as a system message
             messages.append({
@@ -335,34 +372,34 @@ Instructions:
 
 class SmartLLMSelector:
     """Automatically detect and use available LLM"""
-    
+
     @staticmethod
-    def find_available_llm(debug_mode: bool = False) -> Optional[LLMConnector]:
+    def find_available_llm(debug_mode: bool = False, error_handler: Optional["ErrorHandler"] = None) -> Optional[LLMConnector]:
         """Try each provider and return first available"""
-        
+
         print("🔍 Searching for available LLM services...")
-        
+
         # Try LM Studio first (most user-friendly)
-        lm_connector = LLMConnector(LLMProvider.LMSTUDIO, debug_mode=debug_mode)
+        lm_connector = LLMConnector(LLMProvider.LMSTUDIO, debug_mode=debug_mode, error_handler=error_handler)
         if lm_connector.test_connection():
             return lm_connector
-        
+
         # Try TGI
-        tgi_connector = LLMConnector(LLMProvider.TGI, debug_mode=debug_mode)
+        tgi_connector = LLMConnector(LLMProvider.TGI, debug_mode=debug_mode, error_handler=error_handler)
         if tgi_connector.test_connection():
             return tgi_connector
-        
+
         # Try Ollama
-        ollama_connector = LLMConnector(LLMProvider.OLLAMA, debug_mode=debug_mode)
+        ollama_connector = LLMConnector(LLMProvider.OLLAMA, debug_mode=debug_mode, error_handler=error_handler)
         if ollama_connector.test_connection():
             return ollama_connector
-        
+
         print("❌ No LLM service found")
         print("\nTo use an LLM:")
         print("  - LM Studio: Start it and load a model")
         print("  - TGI: docker run --gpus all -p 8080:80 ghcr.io/huggingface/text-generation-inference:latest --model-id Qwen/Qwen2.5-0.5B-Instruct")
         print("  - Ollama: ollama run llama2")
-        
+
         return None
 
 # Quick test function

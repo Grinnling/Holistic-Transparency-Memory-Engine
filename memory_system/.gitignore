@@ -1,0 +1,54 @@
+# =============================================================================
+# CODE_IMPLEMENTATION .gitignore
+# =============================================================================
+
+# --- Environment Files (NEVER commit these) ---
+.env
+.env.local
+.env.*.local
+*.env
+
+# --- Dependencies ---
+node_modules/
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+*.egg-info/
+*.egg
+dist/
+build/
+
+# --- IDE/Editor ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# --- Testing ---
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# --- Build Outputs ---
+*.log
+*.pid
+*.seed
+*.pid.lock
+
+# --- Vite/React ---
+dist/
+dist-ssr/
+*.local
+
+# --- Local Data ---
+*.db
+*.sqlite
+*.sqlite3
+
+# --- Keep .env.example (template for documentation) ---
+!.env.example

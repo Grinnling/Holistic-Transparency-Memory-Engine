@@ -1,0 +1,57 @@
+version: '3.8'
+
+services:
+  # =============================================================================
+  # REDIS - Cache & Message Queue
+  # =============================================================================
+  # Used for:
+  # - Agent message queues (scratchpad routing)
+  # - Yarn board hot state (grabbed points)
+  # - Agent presence/status
+  # - Pub/sub notifications
+  #
+  # NOT used for (these stay in SQLite):
+  # - Conversation history
+  # - Cross-ref persistence
+  # - User authentication
+  # - Long-term memory
+  #
+  # See SIDEBAR_PERSISTENCE_IMPLEMENTATION.md Section 9.12 for design.
+  # =============================================================================
+
+  redis:
+    image: redis:7-alpine
+    container_name: memory_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  # =============================================================================
+  # Future services (commented for reference)
+  # =============================================================================
+
+  # api:
+  #   build: .
+  #   container_name: memory_api
+  #   ports:
+  #     - "8000:8000"
+  #   depends_on:
+  #     redis:
+  #       condition: service_healthy
+  #   environment:
+  #     - REDIS_HOST=redis
+  #     - REDIS_PORT=6379
+  #   volumes:
+  #     - ./data:/app/data
+
+volumes:
+  redis_data:
+    driver: local

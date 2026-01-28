@@ -7,6 +7,7 @@ Amalgamated from parallel development and session work
 
 import traceback
 import logging
+import uuid
 from datetime import datetime
 from typing import Optional, Dict, Any, Callable, List
 from enum import Enum
@@ -93,18 +94,67 @@ class ErrorHandler:
         # Auto-recovery tracking
         self.recovery_attempts = defaultdict(int)
         self.recovery_successes = defaultdict(int)
-        
+
+        # Acknowledgement tracking
+        self.acknowledged_errors: set = set()
+
+        # Recovery systems (late-bound after initialization)
+        self._backup_system = None
+        self._recovery_thread = None
+        self._service_manager = None
+
         # Configure logging
         self.logger = logging.getLogger('rich_chat_errors')
         self.logger.setLevel(logging.DEBUG if debug_mode else logging.INFO)
-        
+
         # Add file handler for persistent error logging
         if not self.logger.handlers:
-            handler = logging.FileHandler('/tmp/rich_chat_errors.log')
+            handler = logging.FileHandler('/home/grinnling/Development/CODE_IMPLEMENTATION/logs/errors.log')
             handler.setFormatter(logging.Formatter(
                 '%(asctime)s - %(levelname)s - %(message)s'
             ))
             self.logger.addHandler(handler)
+
+    def get_error_by_id(self, error_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Find an error record by its ID.
+
+        Args:
+            error_id: The UUID of the error to find
+
+        Returns:
+            The error record if found, None otherwise
+        """
+        for error in self.recent_errors:
+            if error.get('error_id') == error_id:
+                return error
+        return None
+
+    def acknowledge_error(self, error_id: str) -> Dict[str, Any]:
+        """
+        Acknowledge an error by ID with validation.
+
+        Args:
+            error_id: The UUID of the error to acknowledge
+
+        Returns:
+            Dict with status and error info
+        """
+        error_record = self.get_error_by_id(error_id)
+        if error_record is None:
+            return {
+                'success': False,
+                'error': f'Error ID not found: {error_id}',
+                'error_id': error_id
+            }
+
+        self.acknowledged_errors.add(error_id)
+        return {
+            'success': True,
+            'error_id': error_id,
+            'error_category': error_record.get('category'),
+            'error_message': error_record.get('message')
+        }
     
     def handle_error(self, 
                     error: Exception, 
@@ -155,8 +205,10 @@ class ErrorHandler:
         # Route error to appropriate destination
         self._route_error(error_message, category, severity, recovery_succeeded)
         
-        # Store for pattern analysis
+        # Store for pattern analysis with stable UUID for acknowledgement
+        error_id = str(uuid.uuid4())
         self.recent_errors.append({
+            'error_id': error_id,
             'timestamp': current_time,
             'category': category.value,
             'severity': severity.value,
@@ -209,20 +261,116 @@ class ErrorHandler:
             
         return recovery_succeeded
     
+    def register_recovery_systems(self, backup_system=None, recovery_thread=None, service_manager=None):
+        """
+        Register recovery systems for automatic error recovery.
+
+        Called after ErrorHandler is initialized and other systems are ready.
+        This allows late-binding since ErrorHandler is created first.
+
+        Args:
+            backup_system: EmergencyBackupSystem instance for disk-based recovery
+            recovery_thread: RecoveryThread instance for automatic sync
+            service_manager: ServiceManager instance for service health checks
+        """
+        if backup_system:
+            self._backup_system = backup_system
+            self.logger.info("Registered backup_system for episodic recovery")
+        if recovery_thread:
+            self._recovery_thread = recovery_thread
+            self.logger.info("Registered recovery_thread for automatic sync")
+        if service_manager:
+            self._service_manager = service_manager
+            self.logger.info("Registered service_manager for service recovery")
+
     def _recover_episodic_memory(self) -> bool:
-        """Attempt to recover episodic memory service"""
-        # Placeholder for actual recovery logic
-        # Would integrate with backup system
-        return False
-    
+        """
+        Attempt to recover episodic memory service.
+
+        Recovery strategy:
+        1. Check if recovery thread is running, start if not
+        2. Force immediate recovery cycle
+        3. Check pending count before/after to verify progress
+        """
+        if not self._backup_system or not self._recovery_thread:
+            self.logger.debug("Recovery systems not registered, cannot recover episodic memory")
+            return False
+
+        try:
+            # Check pending count before recovery
+            pending_before = self._backup_system.get_pending_count()
+
+            if pending_before == 0:
+                # Nothing to recover
+                return True
+
+            # Ensure recovery thread is running
+            if not self._recovery_thread.is_running():
+                self._recovery_thread.start_recovery_thread()
+                self.logger.info("Started recovery thread during error recovery")
+
+            # Force immediate recovery cycle
+            result = self._recovery_thread.force_recovery_now()
+
+            if result.get('error'):
+                self.logger.warning(f"Recovery cycle failed: {result['error']}")
+                return False
+
+            # Check if we made progress
+            processed = result.get('processed', 0)
+            if processed > 0:
+                self.logger.info(f"Episodic recovery: processed {processed} pending exchanges")
+                return True
+
+            return False
+
+        except Exception as e:
+            self.logger.error(f"Exception during episodic recovery: {e}")
+            return False
+
     def _recover_service_connection(self) -> bool:
-        """Attempt to recover service connection"""
-        # Placeholder for service restart logic
-        return False
-    
+        """
+        Attempt to recover service connection.
+
+        Uses ServiceManager's smart_recovery if available.
+        """
+        if not self._service_manager:
+            self.logger.debug("ServiceManager not registered, cannot recover service")
+            return False
+
+        try:
+            # Try to auto-start missing services
+            success = self._service_manager.auto_start_services()
+            if success:
+                self.logger.info("Service auto-start succeeded during error recovery")
+            return success
+
+        except Exception as e:
+            self.logger.error(f"Exception during service recovery: {e}")
+            return False
+
     def _recover_llm_connection(self) -> bool:
-        """Attempt to recover LLM connection"""
-        # Placeholder for LLM fallback logic
+        """
+        Attempt to recover LLM connection.
+
+        KNOWN LIMITATION: This is currently a stub that always returns False.
+        LLM recovery requires integration with the LLM service layer which
+        is not yet wired to the ErrorHandler.
+
+        Future implementation options:
+        - Switch to local/fallback model (e.g., ollama)
+        - Retry with exponential backoff
+        - Try alternative API endpoints
+        - Queue messages for later retry
+
+        To implement:
+        1. Add _llm_service attribute
+        2. Add register method for LLM service
+        3. Implement fallback logic based on error type
+        """
+        # LLM recovery would need LLM service reference
+        # For now, return False as we don't have fallback configured
+        self.logger.debug("LLM recovery not implemented - stub returns False")
         return False
     
     def _should_suppress_error(self, error_key: str, current_time: datetime, suppress_minutes: int) -> bool:

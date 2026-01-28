@@ -5,6 +5,7 @@ Single point for all episodic memory access - prevents conflicts between
 rich_chat and recovery_thread when both need to write to episodic memory
 """
 
+import os
 import requests
 import json
 import time
@@ -23,15 +24,18 @@ class EpisodicMemoryCoordinator:
     Provides fallback to backup system when episodic memory is unavailable
     """
     
-    def __init__(self, episodic_url: str = 'http://localhost:8005', backup_system=None, error_handler=None):
+    def __init__(self, episodic_url: str = None, backup_system=None, error_handler=None):
         """
         Initialize coordinator
 
         Args:
-            episodic_url: URL of episodic memory service
+            episodic_url: URL of episodic memory service (uses EPISODIC_MEMORY_URL env var if not provided)
             backup_system: EmergencyBackupSystem instance for fallback
             error_handler: ErrorHandler instance for proper error routing
         """
+        # Use environment variable with fallback to localhost default
+        if episodic_url is None:
+            episodic_url = os.environ.get('EPISODIC_MEMORY_URL', 'http://localhost:8005')
         self.episodic_url = episodic_url.rstrip('/')
         self.backup_system = backup_system
         self.error_handler = error_handler
@@ -110,7 +114,7 @@ class EpisodicMemoryCoordinator:
                 # Server error - capture error details and try backup
                 try:
                     error_details = response.json().get('message', response.text)
-                except:
+                except Exception:
                     error_details = response.text[:200] if response.text else 'No error details'
 
                 error_reason = f"HTTP {response.status_code}: {error_details}"
@@ -155,7 +159,13 @@ class EpisodicMemoryCoordinator:
                 warning_msg = f"Episodic memory failed ({error_reason}), queued for recovery: {exchange_id}"
                 if self.error_handler:
                     from error_handler import ErrorCategory, ErrorSeverity
-                    self.error_handler._route_error(warning_msg, ErrorCategory.EPISODIC_MEMORY, ErrorSeverity.MEDIUM_ALERT)
+                    self.error_handler.handle_error(
+                        Exception(warning_msg),
+                        ErrorCategory.EPISODIC_MEMORY,
+                        ErrorSeverity.MEDIUM_ALERT,
+                        context="Episodic coordinator fallback to backup",
+                        operation="archive_exchange_fallback"
+                    )
                 else:
                     coordinator_logger.warning(warning_msg)
                 
@@ -169,8 +179,20 @@ class EpisodicMemoryCoordinator:
                 }
                 
             except Exception as backup_error:
-                coordinator_logger.error(f"Both episodic memory and backup failed: {backup_error}")
-                
+                error_msg = f"Both episodic memory and backup failed: {backup_error}"
+                coordinator_logger.error(error_msg)
+
+                # Critical: Both systems failed - route to error handler
+                if self.error_handler:
+                    from error_handler import ErrorCategory, ErrorSeverity
+                    self.error_handler.handle_error(
+                        backup_error,
+                        ErrorCategory.BACKUP_SYSTEM,
+                        ErrorSeverity.CRITICAL_STOP,
+                        context=f"Episodic failed ({error_reason}), backup also failed",
+                        operation="total_failure_fallback"
+                    )
+
                 return {
                     'success': False,
                     'source': source,
@@ -179,8 +201,20 @@ class EpisodicMemoryCoordinator:
                     'backup_error': str(backup_error)
                 }
         else:
-            coordinator_logger.error(f"Episodic memory failed and no backup system available: {error_reason}")
-            
+            error_msg = f"Episodic memory failed and no backup system available: {error_reason}"
+            coordinator_logger.error(error_msg)
+
+            # Critical: No backup available - route to error handler
+            if self.error_handler:
+                from error_handler import ErrorCategory, ErrorSeverity
+                self.error_handler.handle_error(
+                    Exception(error_msg),
+                    ErrorCategory.EPISODIC_MEMORY,
+                    ErrorSeverity.CRITICAL_STOP,
+                    context="No backup system configured",
+                    operation="no_backup_available"
+                )
+
             return {
                 'success': False,
                 'source': source,
@@ -224,7 +258,20 @@ class EpisodicMemoryCoordinator:
                 }
                 
         except Exception as e:
-            coordinator_logger.error(f"Failed to retrieve conversation {conversation_id}: {e}")
+            error_msg = f"Failed to retrieve conversation {conversation_id}: {e}"
+            coordinator_logger.error(error_msg)
+
+            # Route to error handler for visibility
+            if self.error_handler:
+                from error_handler import ErrorCategory, ErrorSeverity
+                self.error_handler.handle_error(
+                    e,
+                    ErrorCategory.EPISODIC_MEMORY,
+                    ErrorSeverity.HIGH_DEGRADE,
+                    context=f"Retrieving conversation {conversation_id}",
+                    operation="retrieve_conversation"
+                )
+
             return {
                 'success': False,
                 'error': str(e),
@@ -262,7 +309,20 @@ class EpisodicMemoryCoordinator:
                 }
                 
         except Exception as e:
-            coordinator_logger.error(f"Failed to list conversations: {e}")
+            error_msg = f"Failed to list conversations: {e}"
+            coordinator_logger.error(error_msg)
+
+            # Route to error handler for visibility
+            if self.error_handler:
+                from error_handler import ErrorCategory, ErrorSeverity
+                self.error_handler.handle_error(
+                    e,
+                    ErrorCategory.EPISODIC_MEMORY,
+                    ErrorSeverity.HIGH_DEGRADE,
+                    context="Listing conversations from episodic memory",
+                    operation="list_conversations"
+                )
+
             return {
                 'success': False,
                 'error': str(e),
@@ -295,6 +355,17 @@ class EpisodicMemoryCoordinator:
             }
             
         except Exception as e:
+            # Route to error handler for visibility
+            if self.error_handler:
+                from error_handler import ErrorCategory, ErrorSeverity
+                self.error_handler.handle_error(
+                    e,
+                    ErrorCategory.EPISODIC_MEMORY,
+                    ErrorSeverity.LOW,  # Verification failure is not critical
+                    context=f"Verifying exchange {exchange_id}",
+                    operation="verify_exchange"
+                )
+
             return {
                 'success': False,
                 'verified': False,
@@ -340,7 +411,18 @@ class EpisodicMemoryCoordinator:
         except Exception as e:
             self.service_healthy = False
             self.last_health_check = datetime.now()
-            
+
+            # Route to error handler for visibility
+            if self.error_handler:
+                from error_handler import ErrorCategory, ErrorSeverity
+                self.error_handler.handle_error(
+                    e,
+                    ErrorCategory.EPISODIC_MEMORY,
+                    ErrorSeverity.HIGH_DEGRADE,
+                    context="Episodic memory health check failed",
+                    operation="health_check"
+                )
+
             return {
                 'healthy': False,
                 'status': 'connection_failed',

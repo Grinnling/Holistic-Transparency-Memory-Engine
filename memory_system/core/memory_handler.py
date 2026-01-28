@@ -418,19 +418,51 @@ class MemoryHandler:
                     self._debug_message(f"Retrieved {len(results)} relevant memories", ErrorCategory.EPISODIC_MEMORY)
                 return results
             else:
-                self._warning_message(
-                    f"Failed to retrieve memories: {response.status_code}",
-                    ErrorCategory.EPISODIC_MEMORY
-                )
+                # Enhanced logging for 500 errors to help debug sporadic failures
+                error_msg = f"Failed to retrieve memories: {response.status_code}"
+                if response.status_code == 500:
+                    # Log additional context for 500 errors
+                    import datetime
+                    timestamp = datetime.datetime.now().isoformat()
+                    error_details = {
+                        "timestamp": timestamp,
+                        "status_code": response.status_code,
+                        "query": query,
+                        "limit": top_k,
+                        "endpoint": f"{self.services['episodic_memory']}/search",
+                        "response_text": response.text[:500] if response.text else "No response body"
+                    }
+                    # Log to console for immediate visibility
+                    print(f"\n🚨 500 ERROR CAPTURED - Memory Service")
+                    print(f"Timestamp: {timestamp}")
+                    print(f"Query: {query}")
+                    print(f"Response: {response.text[:500] if response.text else 'No response body'}")
+                    print(f"Full details: {error_details}\n")
+
+                self._warning_message(error_msg, ErrorCategory.EPISODIC_MEMORY)
                 return []
 
-        except requests.exceptions.Timeout:
+        except requests.exceptions.Timeout as e:
             self._warning_message("Memory retrieval timeout - continuing without context", ErrorCategory.EPISODIC_MEMORY)
+            self.error_handler.handle_error(
+                e,
+                ErrorCategory.EPISODIC_MEMORY,
+                ErrorSeverity.MEDIUM_ALERT,
+                context="Memory retrieval timeout",
+                operation="retrieve_relevant_memories"
+            )
             return []
         except Exception as e:
             self._warning_message(
                 f"Error retrieving memories: {str(e)}",
                 ErrorCategory.EPISODIC_MEMORY
+            )
+            self.error_handler.handle_error(
+                e,
+                ErrorCategory.EPISODIC_MEMORY,
+                ErrorSeverity.MEDIUM_ALERT,
+                context=f"Error retrieving memories: {str(e)[:50]}",
+                operation="retrieve_relevant_memories"
             )
             return []
 
@@ -465,6 +497,13 @@ class MemoryHandler:
         except Exception as e:
             if self.debug_mode:
                 self._debug_message(f"Error getting memory count: {str(e)}", ErrorCategory.EPISODIC_MEMORY)
+            self.error_handler.handle_error(
+                e,
+                ErrorCategory.EPISODIC_MEMORY,
+                ErrorSeverity.LOW_DEBUG,
+                context="Getting memory count for stats",
+                operation="get_memory_count"
+            )
             return 0
 
     def search_memories(self, query: str):
@@ -529,8 +568,17 @@ class MemoryHandler:
             self.console.print(f"[dim]DEBUG: {message}[/dim]")
 
     def _info_message(self, message: str, category: ErrorCategory):
-        """Info message output - override in subclass or connect to main UI"""
+        """Info message output - routes to centralized error handler"""
         self.console.print(f"[blue]INFO: {message}[/blue]")
+
+        # Push to centralized error handler for UI visibility
+        self.error_handler.handle_error(
+            Exception(message),
+            category,
+            ErrorSeverity.LOW_DEBUG,  # Info messages are low severity debug
+            context="Memory operation info",
+            operation="memory_handler"
+        )
 
     def _warning_message(self, message: str, category: ErrorCategory):
         """Warning message output - uses centralized error handler"""

@@ -23,12 +23,25 @@ except ImportError:
 import requests
 import json
 import uuid
+from uuid_extensions import uuid7
 from datetime import datetime
 from typing import Optional, Dict, List
 import sys
 import os
 import signal
 import threading
+from contextvars import ContextVar
+
+# Fallback request ID for standalone mode (when not running through api_server_bridge)
+_standalone_request_id: ContextVar[str] = ContextVar('standalone_request_id', default=None)
+
+def _get_or_create_standalone_id() -> str:
+    """Get or create a request ID for standalone rich_chat usage."""
+    current = _standalone_request_id.get()
+    if current is None:
+        current = str(uuid7())
+        _standalone_request_id.set(current)
+    return current
 
 # Import our modules
 from llm_connector import SmartLLMSelector, LLMConnector
@@ -42,14 +55,21 @@ from recovery_chat_commands import RecoveryChatInterface
 from error_handler import ErrorHandler, ErrorCategory, ErrorSeverity
 from service_manager import ServiceManager
 from memory_handler import MemoryHandler
+from command_handler import CommandHandler
+from conversation_orchestrator import ConversationOrchestrator, get_orchestrator
+from conversation_manager import ConversationManager
+from datashapes import SidebarStatus
+from chat_logger import ChatLogger
+from response_enhancer import ResponseEnhancer
 
 class RichMemoryChat:
-    def __init__(self, debug_mode=False, auto_start_services=False):
+    def __init__(self, debug_mode=False, auto_start_services=False, error_handler=None):
         """Initialize chat with optional debug mode and auto-start
-        
+
         Args:
             debug_mode: Show debug info (prompts, context, etc.)
             auto_start_services: Automatically start memory services if not running
+            error_handler: Optional shared ErrorHandler instance (creates new if None)
         """
         if not RICH_AVAILABLE:
             print("❌ Rich library not available. Install with: pip install rich")
@@ -69,12 +89,35 @@ class RichMemoryChat:
         self.fuck_it_we_ball_mode = False  # Debug mode for critical operations
         
         # Initialize ErrorHandler FIRST (before anything that might error)
-        self.error_handler = ErrorHandler(
-            console=self.console,
-            debug_mode=debug_mode,
-            fuck_it_we_ball_mode=self.fuck_it_we_ball_mode
+        # Use provided error_handler or create new one
+        if error_handler is not None:
+            self.error_handler = error_handler
+        else:
+            self.error_handler = ErrorHandler(
+                console=self.console,
+                debug_mode=debug_mode,
+                fuck_it_we_ball_mode=self.fuck_it_we_ball_mode
+            )
+
+        # Initialize ChatLogger for raw exchange logging (lab notes layer)
+        self.chat_logger = ChatLogger(
+            error_handler=self.error_handler,
+            debug_mode=debug_mode
         )
-        
+
+        # Initialize ResponseEnhancer for confidence analysis (OMNI-MODEL design)
+        self.response_enhancer = ResponseEnhancer(
+            error_handler=self.error_handler,
+            show_confidence=self.show_confidence
+        )
+
+        # Initialize UIHandler for display operations
+        from ui_handler import UIHandler
+        self.ui_handler = UIHandler(console=self.console, error_handler=self.error_handler)
+
+        # Initialize CommandHandler for command routing
+        self.command_handler = CommandHandler(chat_instance=self, error_handler=self.error_handler)
+
         # UI state
         self.status_messages = []  # Queue for status messages
         # self.alert_messages removed - now using error_handler.alert_queue
@@ -130,18 +173,37 @@ class RichMemoryChat:
             self.episodic_coordinator = None
             self.recovery_chat = None
         
-        # Initialize components
-        self.conversation_id = str(uuid.uuid4())
-        self.conversation_history = []
-        
-        # Try to restore previous conversation
-        self.restore_conversation_history()
-        
+        # Initialize ConversationManager (handles persistence + orchestrator + OZOLITH)
+        self.orchestrator = get_orchestrator(error_handler=self.error_handler)
+        self.conversation_manager = ConversationManager(
+            service_manager=self.service_manager,
+            error_handler=self.error_handler,
+            orchestrator=self.orchestrator
+        )
+
+        # Start initial conversation (creates root context, logs to OZOLITH)
+        self.conversation_manager.start_new_conversation(task_description="Main conversation")
+
+        # Restore previous conversation history
+        self.conversation_manager.restore_conversation_history()
+
+        # Expose for backwards compatibility (other modules may reference these)
+        # TODO: Migrate all references to use conversation_manager directly
+        self.conversation_id = self.conversation_manager.conversation_id
+        self.conversation_history = self.conversation_manager.conversation_history
+
+        # [DEBUG-SYNC] Verify reference setup after init
+        print(f"[DEBUG-SYNC] rich_chat.__init__ reference check:")
+        print(f"[DEBUG-SYNC]   chat.conversation_history id: {id(self.conversation_history)}")
+        print(f"[DEBUG-SYNC]   cm.conversation_history id: {id(self.conversation_manager.conversation_history)}")
+        print(f"[DEBUG-SYNC]   Same object: {self.conversation_history is self.conversation_manager.conversation_history}")
+        print(f"[DEBUG-SYNC]   Current length: {len(self.conversation_history)}")
+
         # Initialize LLM, Skinflap, and Memory Distillation
         with self.console.status("[bold blue]Initializing systems..."):
-            self.llm = SmartLLMSelector.find_available_llm(debug_mode=self.debug_mode)
+            self.llm = SmartLLMSelector.find_available_llm(debug_mode=self.debug_mode, error_handler=self.error_handler)
             self.skinflap = CollaborativeQueryReformer()
-            self.distillation_engine = MemoryDistillationEngine()
+            self.distillation_engine = MemoryDistillationEngine(error_handler=self.error_handler)
             self.memory_buffer_limit = 100  # Trigger distillation at 100 exchanges
             self.generation_interrupted = False  # Flag for stopping generation
             # Check service health with extras (LLM, Skinflap)
@@ -168,88 +230,52 @@ class RichMemoryChat:
         signal.signal(signal.SIGINT, self.signal_handler)
     
     # Service management methods removed - now handled by ServiceManager
-    
+
+    def _get_trace_headers(self, source_service: str = "rich_chat") -> dict:
+        """
+        Build headers for inter-service calls with request ID propagation.
+
+        Tries to get request ID from api_server_bridge context first.
+        Falls back to standalone ID if running outside API context.
+
+        Args:
+            source_service: Name of this service (for X-Source-Service header)
+
+        Returns:
+            dict: Headers to include in requests
+        """
+        # Try to get ID from shared request context module
+        try:
+            from request_context import get_request_id
+
+            request_id = get_request_id()
+            if request_id and request_id != "unknown":
+                return {
+                    "X-Request-ID": request_id,
+                    "X-Source-Service": source_service
+                }
+        except ImportError:
+            pass  # Shared module not available, use fallback
+        except Exception:
+            pass  # Unexpected error, use fallback
+
+        # Fallback: generate/reuse standalone ID (for standalone rich_chat usage)
+        fallback_id = _get_or_create_standalone_id()
+        return {
+            "X-Request-ID": fallback_id,
+            "X-Source-Service": source_service
+        }
+
     def restore_conversation_history(self):
         """Restore recent conversation history from working memory and episodic memory"""
-        try:
-            # First try working memory for recent exchanges
-            response = requests.get(
-                f"{self.services['working_memory']}/working-memory",
-                params={"limit": 30},  # Reduced to leave room for episodic
-                timeout=5
-            )
-            if response.status_code == 200:
-                data = response.json()
-                exchanges = data.get('context', [])
-                
-                for exchange in exchanges:
-                    self.conversation_history.append({
-                        'user': exchange.get('user_message', ''),
-                        'assistant': exchange.get('assistant_response', ''),
-                        'exchange_id': exchange.get('exchange_id', ''),
-                        'timestamp': exchange.get('created_at', ''),
-                        'restored': True,
-                        'source': 'working_memory'
-                    })
-                
-                working_count = len(exchanges)
-            else:
-                working_count = 0
-                
-            # Try episodic memory for additional context
-            try:
-                episodic_response = requests.get(
-                    f"{self.services['episodic_memory']}/recent",
-                    params={"limit": 20},  # Additional recent conversations
-                    timeout=5
-                )
-                if episodic_response.status_code == 200:
-                    episodic_data = episodic_response.json()
-                    conversations = episodic_data.get('conversations', [])
-                    
-                    # Add episodic conversations (avoid duplicates by checking timestamps)
-                    existing_timestamps = {ex.get('timestamp', '') for ex in self.conversation_history}
-                    
-                    episodic_count = 0
-                    for conv in conversations:
-                        # Extract key exchanges from conversation
-                        exchanges = conv.get('exchanges', [])
-                        for exchange in exchanges[-2:]:  # Last 2 from each conversation
-                            timestamp = exchange.get('timestamp', '')
-                            if timestamp not in existing_timestamps:
-                                self.conversation_history.append({
-                                    'user': exchange.get('user_input', ''),
-                                    'assistant': exchange.get('assistant_response', ''),
-                                    'exchange_id': exchange.get('exchange_id', ''),
-                                    'timestamp': timestamp,
-                                    'restored': True,
-                                    'source': 'episodic_memory'
-                                })
-                                episodic_count += 1
-                                
-                    if episodic_count > 0:
-                        self.debug_message(f"Added {episodic_count} exchanges from episodic memory", ErrorCategory.HISTORY_RESTORATION)
-            except Exception as e:
-                self.error_handler.handle_error(
-                    e,
-                    ErrorCategory.EPISODIC_MEMORY,
-                    ErrorSeverity.LOW_DEBUG,
-                    context="Loading episodic memory for history restoration",
-                    operation="episodic_history_fallback"
-                )
-                
-            total_restored = working_count + episodic_count if 'episodic_count' in locals() else working_count
-            if total_restored > 0:
-                self.debug_message(f"Restored {total_restored} total exchanges ({working_count} working + {episodic_count if 'episodic_count' in locals() else 0} episodic)", ErrorCategory.HISTORY_RESTORATION)
-                        
-        except Exception as e:
-            self.error_handler.handle_error(
-                e,
-                ErrorCategory.HISTORY_RESTORATION,
-                ErrorSeverity.LOW_DEBUG,
-                context="Restoring conversation history",
-                operation="restore_conversation_history"
-            )
+        # Delegate to ConversationManager (handles working + episodic memory, OZOLITH logging)
+        total_restored = self.conversation_manager.restore_conversation_history()
+
+        # Update local reference for backwards compatibility
+        self.conversation_history = self.conversation_manager.conversation_history
+
+        if total_restored > 0:
+            self.debug_message(f"Restored {total_restored} exchanges from memory services", ErrorCategory.HISTORY_RESTORATION)
     
     def process_message(self, user_message: str) -> Dict:
         """Process message with rich progress indicators"""
@@ -287,34 +313,66 @@ class RichMemoryChat:
                         'partial_response': assistant_response
                     }
 
-                # Step 4: Store in memory
-                status.update("[bold cyan]💾 Storing in memory...")
-                exchange_id = self.store_exchange(user_message, assistant_response)
-
-                # Step 5: Validate
+                # Step 4: Validate
                 status.update("[bold magenta]✅ Validating response...")
                 validation = self.validate_with_curator(user_message, assistant_response)
 
-            # Add confidence markers if enabled
-            enhanced_response = self.add_confidence_markers(assistant_response, user_message)
+            # Add confidence markers if enabled (using ResponseEnhancer)
+            enhanced_response = self.response_enhancer.enhance_response(
+                response=assistant_response,
+                user_message=user_message,
+                curator_validation=None  # Full CuratorValidation will come when curator becomes an agent
+            )
 
-            # Add to history
-            self.conversation_history.append({
-                'user': user_message,
-                'assistant': enhanced_response,
-                'exchange_id': exchange_id,
-                'validation': validation,
-                'timestamp': datetime.now().isoformat(),
-                'source': 'current'
-            })
+            # Format retrieved memories for persistence (readable, not raw dicts)
+            formatted_memories = [self._extract_memory_content(m) for m in relevant_memories[:3]] if relevant_memories else []
+
+            # Step 5: Store in memory (SINGLE storage path - includes validation and retrieved_memories)
+            exchange_id = self.store_exchange(
+                user_message=user_message,
+                assistant_response=enhanced_response,
+                metadata={
+                    'validation': validation,
+                    'source': 'current',
+                    'retrieved_memories': formatted_memories
+                }
+            )
+
+            # NOTE: conversation_history append is handled by conversation_manager.store_exchange()
+            # DO NOT append here - that causes duplicates since they share the same list reference
 
             # Archive to episodic memory (async, non-blocking)
             self.memory_handler.archive_to_episodic_memory(user_message, enhanced_response, exchange_id)
 
+            # Log raw exchange to JSONL files (lab notes layer - always runs)
+            self.chat_logger.log_exchange(
+                user_message=user_message,
+                assistant_response=assistant_response,
+                conversation_id=self.conversation_id,
+                exchange_id=exchange_id,
+                request_id=self._get_trace_headers().get("X-Request-ID")
+            )
+
+            # Check for degraded state (storage failure)
+            storage_warning = None
+            if exchange_id is None:
+                storage_warning = "⚠️ This exchange was NOT saved to memory (working_memory unavailable)"
+                # Also log to error panel for visibility
+                self.error_handler.handle_error(
+                    error=Exception("Working memory storage failed - exchange not saved"),
+                    category=ErrorCategory.WORKING_MEMORY,
+                    severity=ErrorSeverity.HIGH_DEGRADE,
+                    context=f"User message: {user_message[:50]}...",
+                    operation="store_exchange_degraded",
+                    attempt_recovery=False  # Don't retry, just log it
+                )
+
             result_dict = {
                 'response': enhanced_response,
                 'type': 'normal',
-                'validation': validation
+                'validation': validation,
+                'retrieved_context': [self._extract_memory_content(m) for m in relevant_memories[:3]],  # Debug: First 3 memories, formatted
+                'storage_warning': storage_warning  # None if stored successfully, warning message if failed
             }
             print(f"DEBUG: About to return result_dict: {type(result_dict)}, keys: {result_dict.keys()}")
             return result_dict
@@ -384,61 +442,111 @@ PLEASE PROVIDE MORE SPECIFIC PARAMETERS.
 
 *LED lights blinking frantically* 💡"""
     
-    def store_exchange(self, user_message: str, assistant_response: str):
-        """Store in working memory"""
-        with self.error_handler.create_context_manager(
-            ErrorCategory.WORKING_MEMORY,
-            ErrorSeverity.HIGH_DEGRADE,  # Data loss is serious!
-            operation="store_exchange",
-            context=f"Storing {len(user_message)} char message"
-        ):
-            response = requests.post(
-                f"{self.services['working_memory']}/working-memory",
-                json={
-                    "user_message": user_message,
-                    "assistant_response": assistant_response,
-                    "context_used": ["rich_chat"]
-                },
-                timeout=5
-            )
-            if response.status_code == 200:
-                return response.json().get('exchange', {}).get('exchange_id', 'unknown')
-            else:
-                # Raise exception so error handler catches it
-                raise Exception(f"Working memory returned {response.status_code}")
-        return None
-    
+    def store_exchange(self, user_message: str, assistant_response: str, metadata: dict = None):
+        """Store exchange via ConversationManager (orchestrator + OZOLITH + working memory)"""
+        # Delegate to ConversationManager - handles orchestrator, OZOLITH, and working memory
+        exchange_id = self.conversation_manager.store_exchange(
+            user_message=user_message,
+            assistant_response=assistant_response,
+            metadata=metadata
+        )
+
+        # Update local reference for backwards compatibility
+        self.conversation_history = self.conversation_manager.conversation_history
+
+        return exchange_id
+
+    # log_raw_exchange() removed - now handled by ChatLogger (chat_logger.py)
+
     def validate_with_curator(self, user_message: str, assistant_response: str):
-        """Validate with curator"""
+        """Validate with curator
+
+        TODO: When curator becomes an AGENT (not a service):
+        - This should NOT fail silently
+        - Curator validation is critical for LLM quality feedback
+        - Add error_handler with MEDIUM_ALERT severity
+        - This is a gap {YOU} (LLMs) need - validation feedback improves responses
+        - First agent to add per Phase 3 roadmap
+        """
         try:
             response = requests.post(
-                f"{self.services['curator']}/validate",
+                f"{self.service_manager.services['curator']}/validate",
                 json={
                     "exchange_data": {
                         "user_message": user_message,
                         "assistant_response": assistant_response
                     }
                 },
+                headers=self._get_trace_headers(),
                 timeout=10
             )
             if response.status_code == 200:
                 return response.json().get('validation', {}).get('result', {})
         except:
+            # TEMPORARY: Fails silently until curator agent is connected
+            # When curator is an agent, this MUST alert via error_handler
             pass
         return None
 
     # Memory archival methods removed - now handled by MemoryHandler
 
     def generate_response(self, user_message: str, skinflap_detection=None) -> str:
-        """Generate response using LLM or fallback"""
+        """Generate response using LLM or fallback
+
+        TODO: Multi-model error handling (when multiple LLMs running):
+        - Different severity based on model purpose:
+          * Security agent down = CRITICAL alert
+          * Specialized models (math, code) = MEDIUM alert
+          * General models = LOW_DEBUG (already shown in dashboard)
+        - Consider model failover chain (try backup model before fallback)
+        """
         if self.llm:
             try:
                 return self.llm.generate_response(user_message, self.conversation_history, skinflap_detection=skinflap_detection)
-            except:
-                pass
-        
+            except Exception as e:
+                self.error_handler.handle_error(
+                    e,
+                    ErrorCategory.LLM_COMMUNICATION,
+                    ErrorSeverity.MEDIUM_ALERT,
+                    context=f"Generating response for: {user_message[:50]}...",
+                    operation="generate_response"
+                )
+                # Fall through to generic response below
+
         return f"I understand you're asking: '{user_message}'. Let me help with that."
-    
+
+    def _extract_memory_content(self, memory: dict) -> str:
+        """Extract readable content from an episodic memory result.
+
+        Episodic memories have structure:
+        {
+            '_semantic_score': 0.5,
+            'conversation_id': '...',
+            'full_conversation': [{
+                'user_input': '...',
+                'assistant_response': '...'
+            }]
+        }
+        """
+        score = memory.get('_semantic_score', 0)
+        conv_id = memory.get('conversation_id', 'unknown')[:8]
+
+        # Extract actual conversation content
+        full_conv = memory.get('full_conversation', [])
+        if full_conv and isinstance(full_conv, list) and len(full_conv) > 0:
+            exchange = full_conv[0]
+            user_q = exchange.get('user_input', '')[:80]
+            asst_a = exchange.get('assistant_response', '')[:120]
+            return f"[{score:.2f}|{conv_id}] Q: {user_q}... A: {asst_a}..."
+
+        # Fallback for different structures
+        if 'content' in memory:
+            return f"[{score:.2f}] {memory['content'][:200]}"
+        if 'text' in memory:
+            return f"[{score:.2f}] {memory['text'][:200]}"
+
+        return f"[{score:.2f}|{conv_id}] (memory structure unrecognized)"
+
     def generate_response_interruptible(self, user_message: str, skinflap_detection=None, relevant_memories=None) -> str:
         """Generate response with interruption support and optional skinflap detection info"""
         if not self.llm:
@@ -494,186 +602,46 @@ PLEASE PROVIDE MORE SPECIFIC PARAMETERS.
             return f"I understand you're asking: '{user_message}'. (Generation error: {str(e)})"
     
     def show_status(self):
-        """Show fancy status panel"""
-        status_table = Table(title="📊 System Status")
-        status_table.add_column("Metric", style="cyan")
-        status_table.add_column("Value", style="green")
-        
-        status_table.add_row("Conversation ID", self.conversation_id[:12] + "...")
-        status_table.add_row("Messages", str(len(self.conversation_history)))
-        status_table.add_row("Services", "✅ Healthy" if self.services_healthy else "⚠️ Issues")
-        status_table.add_row("LLM", "✅ Connected" if self.llm else "⚠️ Fallback")
-        
-        # Add recovery system status if available
-        if self.recovery_chat:
-            recovery_status = self.recovery_chat.get_status_for_dashboard()
-            status_table.add_row("Recovery", recovery_status)
-        
+        """Show fancy status panel - delegated to UIHandler"""
+        recovery_status = self.recovery_chat.get_status_for_dashboard() if self.recovery_chat else None
+
+        last_confidence = None
         if self.conversation_history:
             last = self.conversation_history[-1]
             validation = last.get('validation', {})
-            confidence = validation.get('confidence_score', 'N/A')
-            status_table.add_row("Last Confidence", str(confidence))
-        
-        self.console.print(Panel(status_table, title="System Status", border_style="blue"))
+            last_confidence = validation.get('confidence_score')
+
+        self.ui_handler.show_status(
+            conversation_id=self.conversation_id,
+            message_count=len(self.conversation_history),
+            services_healthy=self.services_healthy,
+            llm_available=bool(self.llm),
+            recovery_status=recovery_status,
+            last_confidence=last_confidence
+        )
     
     # Memory display methods removed - now handled by MemoryHandler
     
     def show_help(self):
-        """Show comprehensive help with command explanations"""
-        help_table = Table(title="📖 Rich Memory Chat - Command Reference")
-        help_table.add_column("Command", style="cyan", width=15)
-        help_table.add_column("Description", style="white")
-        help_table.add_column("Example", style="dim", width=20)
-        
-        commands = [
-            ("/help", "Show this help screen", "/help"),
-            ("/memory", "Show recent 15 exchanges with confidence scores", "/memory"),
-            ("/history", "Show ALL conversation history (scrollable)", "/history"),
-            ("/search <term>", "Search conversations for specific topics", "/search authentication"),
-            ("/context", "Preview what context goes to LLM", "/context"),
-            ("/stats", "Memory statistics & distillation learning", "/stats"),
-            ("/debug", "Toggle debug mode (shows prompts/responses)", "/debug"),
-            ("/tokens", "Toggle token counter display", "/tokens"),
-            ("/confidence", "Toggle uncertainty markers in responses", "/confidence"),
-            ("---", "--- Service Management ---", "---"),
-            ("/services", "Check status of all memory services", "/services"),
-            ("/start-services", "Manually start memory services", "/start-services"),
-            ("/stop-services", "Stop auto-started services", "/stop-services"),
-            ("---", "--- Conversation Management ---", "---"),
-            ("/new", "Start a fresh conversation (keeps memory)", "/new"),
-            ("/list", "List previous conversations from episodic memory", "/list"),
-            ("/switch <id>", "Switch to different conversation by ID", "/switch abc123"),
-            ("/quit", "Exit the chat", "/quit or exit"),
-            ("---", "--- Debug Tools ---", "---"),
-            ("/recovery", "Recovery system controls", "/recovery status"),
-            ("/ball", "Toggle 'FUCK IT WE BALL' mode", "/ball"),
-            ("/errors", "Toggle error panel display", "/errors")
-        ]
-        
-        for cmd, desc, example in commands:
-            help_table.add_row(cmd, desc, example)
-        
-        self.console.print(Panel(help_table, border_style="blue"))
-        
-        # Add memory system explanation
-        memory_explanation = """
-📚 **Memory System Guide:**
-• **Restored** = Previous conversations loaded from working memory
-• **Current** = This session's exchanges  
-• **Distillation** = Auto-triggered at 100+ exchanges to compress old context
-• **Learning** = System learns your preferences from distillation corrections
-
-🔍 **Search Tips:**
-• Use specific terms: `/search token counter` 
-• Search works on both your messages and AI responses
-• Results show which part matched (You, AI, or both)
-
-🎛️ **Toggles:**
-• `/debug` = See exactly what prompts are sent to LLM
-• `/tokens` = Show/hide token counts and efficiency metrics  
-• `/confidence` = Enable/disable uncertainty indicators in responses
-        """
-        
-        self.console.print(Panel(memory_explanation.strip(), title="💡 Pro Tips", border_style="green"))
-        
-        # Current system status
+        """Show comprehensive help with command explanations - delegated to UIHandler"""
         stats = self.get_memory_stats()
-        status_text = f"""
-Current Session: {stats['current_session_count']} exchanges | Restored: {stats['restored_count']} | Pressure: {stats['pressure']:.0%}
-Debug: {'ON' if self.debug_mode else 'OFF'} | Tokens: {'ON' if self.show_tokens else 'OFF'} | Confidence: {'ON' if self.show_confidence else 'OFF'}
-        """
-        
-        self.console.print(Panel(status_text.strip(), title="🔧 Current Settings", border_style="yellow"))
+        self.ui_handler.show_help(stats, self.debug_mode)
+    
     
     def show_context_preview(self):
-        """Show what context would be sent to LLM"""
-        if not self.conversation_history:
-            self.console.print(Panel("No conversation history to show", title="🔍 Context Preview"))
-            return
-        
-        # Simulate what the LLM connector does
-        context_table = Table(title="🔍 Context that will be sent to LLM")
-        context_table.add_column("#", width=3)
-        context_table.add_column("Role", width=10)
-        context_table.add_column("Content", style="dim")
-        context_table.add_column("Length", width=8)
-        context_table.add_column("Source", width=12)
-        
-        # Add system prompt
-        system_prompt = """You are a helpful AI assistant with memory capabilities. 
-                    You can remember previous conversations and help users with complex queries.
-                    Be concise but thorough in your responses."""
-        context_table.add_row("1", "system", system_prompt[:60] + "...", str(len(system_prompt)), "hardcoded")
-        
-        # Add last 5 exchanges (same logic as llm_connector.py)
-        total_chars = len(system_prompt)
-        row_num = 2
-        
-        for exchange in self.conversation_history[-5:]:
-            if 'user' in exchange and exchange['user']:
-                user_content = exchange['user']
-                context_table.add_row(
-                    str(row_num), 
-                    "user", 
-                    user_content[:60] + ("..." if len(user_content) > 60 else ""),
-                    str(len(user_content)),
-                    "restored" if exchange.get('restored') else "current"
-                )
-                total_chars += len(user_content)
-                row_num += 1
-                
-            if 'assistant' in exchange and exchange['assistant']:
-                asst_content = exchange['assistant'] 
-                context_table.add_row(
-                    str(row_num),
-                    "assistant",
-                    asst_content[:60] + ("..." if len(asst_content) > 60 else ""),
-                    str(len(asst_content)),
-                    "restored" if exchange.get('restored') else "current"
-                )
-                total_chars += len(asst_content)
-                row_num += 1
-        
-        # Show context stats
-        stats_table = Table(title="📊 Context Statistics")
-        stats_table.add_column("Metric", style="cyan")
-        stats_table.add_column("Value", style="green")
-        
-        stats_table.add_row("Total Messages", str(row_num - 1))
-        stats_table.add_row("Total Characters", str(total_chars))
-        
-        # Only show token info if enabled
-        if self.show_tokens:
-            estimated_tokens = self.estimate_tokens(total_chars)
-            token_color = "red" if estimated_tokens > 1500 else "yellow" if estimated_tokens > 1000 else "green"
-            stats_table.add_row("Estimated Tokens", f"[{token_color}]{estimated_tokens}[/{token_color}]", f"~{estimated_tokens/2000:.0%} of model limit")
-            stats_table.add_row("Token Efficiency", f"{estimated_tokens/(row_num-1):.0f}" if row_num > 1 else "0", "avg tokens per message")
-        
-        stats_table.add_row("Context Strategy", "Last 5 exchanges + system")
-        stats_table.add_row("Restored Count", str(sum(1 for ex in self.conversation_history if ex.get('restored'))))
-        stats_table.add_row("Current Count", str(sum(1 for ex in self.conversation_history if not ex.get('restored'))))
-        
-        self.console.print(Panel(context_table, border_style="blue"))
-        self.console.print(Panel(stats_table, border_style="yellow"))
+        """Show what context would be sent to LLM - delegated to UIHandler"""
+        self.ui_handler.show_context_preview(
+            self.conversation_history,
+            self.show_tokens,
+            self.estimate_tokens
+        )
     
     def toggle_debug_mode(self):
         """Toggle debug mode on/off"""
         self.debug_mode = not self.debug_mode
-        self.llm.debug_mode = self.debug_mode  # Update LLM debug mode too
-        
-        status = "ON 🔍" if self.debug_mode else "OFF 🔕"
-        color = "yellow" if self.debug_mode else "green"
-        
-        self.console.print(Panel(
-            f"Debug mode is now [bold {color}]{status}[/bold {color}]\n\n"
-            f"When ON, you'll see:\n"
-            f"• Exact prompts sent to LLM\n"
-            f"• Model responses\n"
-            f"• Context management details",
-            title="🐛 Debug Mode",
-            border_style=color
-        ))
+        if self.llm:  # Only update LLM debug mode if LLM exists
+            self.llm.debug_mode = self.debug_mode
+        self.ui_handler.toggle_debug_display(self.debug_mode)
     
     def check_memory_pressure(self):
         """Check if memory buffer needs distillation"""
@@ -732,72 +700,18 @@ Debug: {'ON' if self.debug_mode else 'OFF'} | Tokens: {'ON' if self.show_tokens 
             signal.signal(signal.SIGINT, signal.SIG_DFL)
     
     def toggle_token_display(self):
-        """Toggle token display on/off"""
+        """Toggle token display on/off - delegated to UIHandler"""
         self.show_tokens = not self.show_tokens
-        
-        status = "ON 📊" if self.show_tokens else "OFF 🔕"
-        color = "cyan" if self.show_tokens else "green"
-        
-        self.console.print(Panel(
-            f"Token display is now [bold {color}]{status}[/bold {color}]\n\n"
-            f"When ON, you'll see:\n"
-            f"• Token counts in /context\n"
-            f"• Token efficiency in /stats\n"
-            f"• Model limit percentages",
-            title="📊 Token Display",
-            border_style=color
-        ))
+        self.ui_handler.toggle_token_display(self.show_tokens)
     
     def toggle_confidence_display(self):
-        """Toggle confidence/uncertainty markers on/off"""
+        """Toggle confidence/uncertainty markers on/off - delegated to UIHandler"""
         self.show_confidence = not self.show_confidence
-        
-        status = "ON 🤔" if self.show_confidence else "OFF 😐"
-        color = "yellow" if self.show_confidence else "green"
-        
-        self.console.print(Panel(
-            f"Confidence markers are now [bold {color}]{status}[/bold {color}]\n\n"
-            f"When ON, I'll show:\n"
-            f"• Uncertainty indicators (\"I'm not sure...\")\n"
-            f"• Confidence levels in responses\n"
-            f"• Areas where I might be guessing\n"
-            f"• Suggestions to clarify ambiguous requests",
-            title="🤔 Confidence Display",
-            border_style=color
-        ))
+        self.ui_handler.toggle_confidence_display(self.show_confidence)
+        self.response_enhancer.set_show_confidence(self.show_confidence)  # Keep in sync
     
-    def add_confidence_markers(self, response: str, user_message: str) -> str:
-        """Add confidence markers to response if enabled"""
-        if not self.show_confidence:
-            return response
-            
-        # Detect uncertainty patterns and add markers
-        uncertainty_triggers = [
-            ("current", "I don't have access to current/real-time information"),
-            ("weather", "I can't check current weather conditions"),
-            ("stock", "I don't have access to current market data"),
-            ("breaking news", "I can't access current news"),
-            ("specific person", "I may not have current information about specific individuals"),
-            ("exact number", "This number might not be completely accurate"),
-            ("recent events", "My information might be outdated for recent events")
-        ]
-        
-        user_lower = user_message.lower()
-        confidence_note = ""
-        
-        for trigger, note in uncertainty_triggers:
-            if trigger in user_lower:
-                confidence_note = f"\n\n🤔 **Confidence Note:** {note}"
-                break
-        
-        # Add general uncertainty markers for vague questions
-        vague_patterns = ["make it better", "fix this", "help me", "what should i do"]
-        if any(pattern in user_lower for pattern in vague_patterns):
-            if not confidence_note:
-                confidence_note = "\n\n🤔 **Confidence Note:** This seems like a broad request - I might need more specifics to give you the most helpful response."
-        
-        return response + confidence_note
-    
+    # add_confidence_markers() removed - now handled by ResponseEnhancer (response_enhancer.py)
+
     def check_for_clarification_needed(self, user_message: str) -> Dict:
         """Check if user message needs clarification and provide shortcuts"""
         user_lower = user_message.lower().strip()
@@ -852,98 +766,35 @@ Debug: {'ON' if self.debug_mode else 'OFF'} | Tokens: {'ON' if self.show_tokens 
     
     def get_recent_context_hint(self) -> str:
         """Get hints from recent conversation for better clarification"""
-        if len(self.conversation_history) < 2:
-            return ""
-            
-        # Look at last few exchanges for context clues
-        recent_topics = []
-        for exchange in self.conversation_history[-3:]:
-            user_msg = exchange.get('user', '').lower()
-            
-            # Extract potential topics (nouns that might be referenced)
-            topic_keywords = ['bug', 'feature', 'function', 'error', 'issue', 'code', 'script', 'library']
-            for keyword in topic_keywords:
-                if keyword in user_msg:
-                    # Try to extract more context around the keyword
-                    words = user_msg.split()
-                    for i, word in enumerate(words):
-                        if keyword in word:
-                            # Get surrounding context
-                            start = max(0, i-2)
-                            end = min(len(words), i+3)
-                            context = ' '.join(words[start:end])
-                            recent_topics.append(context)
-                            break
-        
-        if recent_topics:
-            return ', '.join(recent_topics[-2:])  # Last 2 topics
-        return ""
+        return self.conversation_manager.get_recent_context_hint()
     
     def show_memory_stats(self):
-        """Show detailed memory statistics and distillation info"""
+        """Show detailed memory statistics and distillation info - delegated to UIHandler"""
         stats = self.get_memory_stats()
-
-        # Memory stats table
-        memory_table = Table(title="💾 Memory System Statistics")
-        memory_table.add_column("Metric", style="cyan")
-        memory_table.add_column("Value", style="green")
-        memory_table.add_column("Details", style="dim")
-
-        memory_table.add_row(
-            "Buffer Usage",
-            f"{stats['current_exchanges']}/{stats['buffer_limit']}",
-            f"Pressure: {stats['pressure']:.0%}"
+        self.ui_handler.show_memory_stats(
+            stats,
+            self.show_tokens,
+            self.estimate_tokens,
+            self.conversation_history,
+            self.distillation_engine
         )
-        memory_table.add_row(
-            "Current Session",
-            str(stats['current_session_count']),
-            "Exchanges this session"
-        )
-        memory_table.add_row(
-            "Restored",
-            str(stats['restored_count']),
-            "From previous sessions"
-        )
-
-        pressure_color = "red" if stats['pressure'] > 0.8 else "yellow" if stats['pressure'] > 0.6 else "green"
-        memory_table.add_row(
-            "Next Distillation",
-            f"{stats['buffer_limit'] - stats['current_exchanges']} exchanges",
-            f"[{pressure_color}]{stats['pressure']:.0%} full[/{pressure_color}]"
-        )
-
-        # Add token information only if enabled
-        if self.show_tokens:
-            total_context_chars = sum(len(ex.get('user', '') + ex.get('assistant', '')) for ex in self.conversation_history)
-            estimated_context_tokens = self.estimate_tokens(total_context_chars)
-            token_color = "red" if estimated_context_tokens > 1500 else "yellow" if estimated_context_tokens > 1000 else "green"
-
-            memory_table.add_row(
-                "Context Tokens",
-                f"[{token_color}]{estimated_context_tokens}[/{token_color}]",
-                f"~{estimated_context_tokens/2000:.0%} of model limit"
-            )
-
-        self.console.print(Panel(memory_table, border_style="blue"))
-
-        # Show distillation learning progress
-        self.distillation_engine.show_learning_progress()
 
     def start_new_conversation(self):
         """Start a fresh conversation (keeps memory, resets context)"""
         old_id = self.conversation_id[:8]
-        
-        # Generate new conversation ID
-        import uuid
-        self.conversation_id = str(uuid.uuid4())
-        
-        # Clear current conversation history (but memory services keep their data)
         old_count = len(self.conversation_history)
-        self.conversation_history = []
-        
+
+        # Delegate to ConversationManager (handles orchestrator + OZOLITH)
+        self.conversation_manager.start_new_conversation(task_description="New conversation")
+
+        # Update local references for backwards compatibility
+        self.conversation_id = self.conversation_manager.conversation_id
+        self.conversation_history = self.conversation_manager.conversation_history
+
         # Reset failure counters
         self.episodic_archival_failures = 0
-        
+
+        # UI display
         self.console.print(Panel(
             f"🆕 **New Conversation Started**\n\n"
             f"• Previous: `{old_id}...` ({old_count} exchanges)\n"
@@ -956,145 +807,394 @@ Debug: {'ON' if self.debug_mode else 'OFF'} | Tokens: {'ON' if self.show_tokens 
     
     def list_conversations(self):
         """List previous conversations from episodic memory"""
-        try:
-            # Get conversation list from episodic memory
-            response = requests.get(
-                f"{self.services['episodic_memory']}/conversations",
-                timeout=5
-            )
-            
-            if response.status_code == 200:
-                conversations = response.json().get('conversations', [])
-                
-                if not conversations:
-                    self.console.print(Panel(
-                        "No previous conversations found in episodic memory.",
-                        title="📝 Conversation History",
-                        border_style="blue"
-                    ))
-                    return
-                
-                # Build conversation table
-                from rich.table import Table
-                conv_table = Table(show_header=True, header_style="bold blue")
-                conv_table.add_column("ID", style="cyan", width=12)
-                conv_table.add_column("Started", style="green", width=19)
-                conv_table.add_column("Exchanges", justify="right", style="yellow")
-                conv_table.add_column("Last Activity", style="magenta", width=19)
-                conv_table.add_column("Status", width=8)
-                
-                for conv in conversations[-10:]:  # Show last 10
-                    conv_id = conv.get('conversation_id', 'unknown')[:8] + '...'
-                    started = conv.get('start_time', 'unknown')[:19] if conv.get('start_time') else 'unknown'
-                    exchange_count = str(conv.get('exchange_count', 0))
-                    last_activity = conv.get('last_activity', 'unknown')[:19] if conv.get('last_activity') else 'unknown'
-                    
-                    # Mark current conversation
-                    status = "🔸 Current" if conv.get('conversation_id') == self.conversation_id else ""
-                    
-                    conv_table.add_row(conv_id, started, exchange_count, last_activity, status)
-                
-                self.console.print(Panel(
-                    conv_table,
-                    title=f"📝 Recent Conversations (showing {len(conversations[-10:])}/{len(conversations)})",
-                    border_style="blue"
-                ))
-                
-                if len(conversations) > 10:
-                    self.console.print(f"[dim]Showing most recent 10 of {len(conversations)} total conversations[/dim]")
-            else:
-                self.warning_message("Could not retrieve conversation list from episodic memory", ErrorCategory.EPISODIC_MEMORY)
-                
-        except Exception as e:
-            self.error_handler.handle_error(
-                e,
-                ErrorCategory.EPISODIC_MEMORY,
-                ErrorSeverity.HIGH_DEGRADE,
-                context="Accessing conversation list",
-                operation="list_conversations"
-            )
-    
+        # Delegate data fetching to ConversationManager
+        conversations = self.conversation_manager.list_conversations(limit=50)
+
+        if not conversations:
+            self.console.print(Panel(
+                "No previous conversations found in episodic memory.\n"
+                "(Service may be unavailable - use [cyan]/start-services[/cyan] to start)",
+                title="📝 Conversation History",
+                border_style="blue"
+            ))
+            return
+
+        # Build conversation table (UI stays here)
+        conv_table = Table(show_header=True, header_style="bold blue")
+        conv_table.add_column("ID", style="cyan", width=12)
+        conv_table.add_column("Started", style="green", width=19)
+        conv_table.add_column("Exchanges", justify="right", style="yellow")
+        conv_table.add_column("Last Activity", style="magenta", width=19)
+        conv_table.add_column("Status", width=8)
+
+        for conv in conversations[-10:]:  # Show last 10
+            conv_id = conv.get('conversation_id', 'unknown')[:8] + '...'
+            started = conv.get('start_time', 'unknown')[:19] if conv.get('start_time') else 'unknown'
+            exchange_count = str(conv.get('exchange_count', 0))
+            last_activity = conv.get('last_activity', 'unknown')[:19] if conv.get('last_activity') else 'unknown'
+
+            # Mark current conversation
+            status = "🔸 Current" if conv.get('conversation_id') == self.conversation_id else ""
+
+            conv_table.add_row(conv_id, started, exchange_count, last_activity, status)
+
+        self.console.print(Panel(
+            conv_table,
+            title=f"📝 Recent Conversations (showing {len(conversations[-10:])}/{len(conversations)})",
+            border_style="blue"
+        ))
+
+        if len(conversations) > 10:
+            self.console.print(f"[dim]Showing most recent 10 of {len(conversations)} total conversations[/dim]")
+
     def switch_conversation(self, target_id: str):
         """Switch to a different conversation by ID"""
+        old_id = self.conversation_id[:8]
+        old_count = len(self.conversation_history)
+
+        # Delegate to ConversationManager (handles ID expansion, loading, OZOLITH logging)
+        success = self.conversation_manager.switch_conversation(target_id)
+
+        if not success:
+            self.console.print(Panel(
+                f"[yellow]Could not switch to conversation '[cyan]{target_id}[/cyan]'.\n\n"
+                f"Possible reasons:\n"
+                f"• Conversation not found\n"
+                f"• Multiple matches (be more specific)\n"
+                f"• Episodic memory service unavailable[/yellow]",
+                title="Switch Failed",
+                border_style="yellow"
+            ))
+            return
+
+        # Update local references for backwards compatibility
+        self.conversation_id = self.conversation_manager.conversation_id
+        self.conversation_history = self.conversation_manager.conversation_history
+
+        # UI display
+        self.console.print(Panel(
+            f"🔄 **Conversation Switched**\n\n"
+            f"• From: `{old_id}...` ({old_count} exchanges)\n"
+            f"• To: `{self.conversation_id[:8]}...` ({len(self.conversation_history)} exchanges)\n"
+            f"• Loaded from episodic memory\n"
+            f"• Ready to continue conversation",
+            title="Conversation Switched",
+            border_style="cyan"
+        ))
+
+    # =========================================================================
+    # SIDEBAR OPERATIONS
+    # =========================================================================
+
+    def spawn_sidebar(self, reason: str, inherit_last_n: int = 10):
+        """
+        Spawn a sidebar to investigate something.
+
+        Usage: /sidebar <reason>
+        Usage: /sidebar 20 <reason>  (inherit 20 exchanges instead of default 10)
+        Example: /sidebar Investigate the auth bug
+        Example: /sidebar 30 Need more context for complex auth flow
+
+        Args:
+            reason: Why we're branching (can be prefixed with number for inherit count)
+            inherit_last_n: How many parent exchanges to inherit (default 10)
+        """
         try:
-            # Expand partial ID if needed (user might type first 8 chars)
-            if len(target_id) < 36:  # Not a full UUID
-                # Get conversation list and find match
-                response = requests.get(
-                    f"{self.services['episodic_memory']}/conversations",
-                    timeout=5
-                )
-                
-                if response.status_code == 200:
-                    conversations = response.json().get('conversations', [])
-                    matches = [conv for conv in conversations if conv.get('conversation_id', '').startswith(target_id)]
-                    
-                    if len(matches) == 0:
-                        self.warning_message(f"No conversation found starting with '{target_id}'", ErrorCategory.EPISODIC_MEMORY)
-                        return
-                    elif len(matches) > 1:
-                        self.warning_message(f"Multiple conversations match '{target_id}'. Be more specific.", ErrorCategory.UI_INPUT)
-                        return
-                    else:
-                        target_id = matches[0]['conversation_id']
-            
-            # Save current conversation to episodic memory if it has exchanges
-            if self.conversation_history:
-                self.console.print("[dim]Saving current conversation...[/dim]")
-            
-            # Load target conversation from episodic memory
-            response = requests.get(
-                f"{self.services['episodic_memory']}/conversation/{target_id}",
-                timeout=5
+            # Check if reason starts with a number (custom inherit count)
+            parts = reason.split(maxsplit=1)
+            if parts and parts[0].isdigit():
+                inherit_last_n = int(parts[0])
+                reason = parts[1] if len(parts) > 1 else "Investigation"
+
+            current_id = self.orchestrator.get_active_context_id()
+            if current_id is None:
+                self.warning_message("No active context to branch from", ErrorCategory.UI_INPUT)
+                return
+
+            # Check how many exchanges parent actually has
+            parent = self.orchestrator.get_context(current_id)
+            available = len(parent.local_memory)
+            actual_inherit = min(inherit_last_n, available)
+
+            sidebar_id = self.orchestrator.spawn_sidebar(
+                parent_id=current_id,
+                reason=reason,
+                inherit_last_n=inherit_last_n,
+                created_by="human"
             )
-            
-            if response.status_code == 200:
-                conv_data = response.json().get('conversation', {})
-                exchanges = conv_data.get('exchanges', [])
-                
-                old_id = self.conversation_id[:8]
-                old_count = len(self.conversation_history)
-                
-                # Switch to new conversation
-                self.conversation_id = target_id
-                self.conversation_history = []
-                
-                # Load exchanges into conversation history
-                for exchange in exchanges:
-                    self.conversation_history.append({
-                        'user': exchange.get('user_input', ''),
-                        'assistant': exchange.get('assistant_response', ''),
-                        'timestamp': exchange.get('timestamp'),
-                        'restored': True  # Mark as restored
-                    })
-                
+
+            # Get the new context for display
+            sidebar = self.orchestrator.get_context(sidebar_id)
+
+            # Build inherited info with helpful hints
+            inherited_count = len(sidebar.inherited_memory)
+            inherited_info = f"• Inherited: {inherited_count} exchanges"
+            if inherited_count < inherit_last_n:
+                inherited_info += f" (requested {inherit_last_n}, parent only had {available})"
+            elif inherit_last_n == 10:
+                inherited_info += f"\n  [dim]Tip: /sidebar 30 <reason> to inherit more context[/dim]"
+
+            self.console.print(Panel(
+                f"🔀 **Sidebar Created: {sidebar_id}**\n\n"
+                f"• Reason: {reason}\n"
+                f"• Parent: {current_id} (now PAUSED)\n"
+                f"{inherited_info}\n"
+                f"• Status: {sidebar.status.value}\n\n"
+                f"[dim]Use /merge to return findings to parent, or /back to return without merging[/dim]",
+                title="Sidebar Spawned",
+                border_style="cyan"
+            ))
+
+            # Automatically process the reason as the first message in the sidebar
+            # This way the user doesn't have to retype their question
+            self.console.print(f"\n[cyan]Processing your question in sidebar...[/cyan]\n")
+            result = self.process_message(reason)
+
+            # Display the response
+            if result and result.get('response'):
                 self.console.print(Panel(
-                    f"🔄 **Conversation Switched**\n\n"
-                    f"• From: `{old_id}...` ({old_count} exchanges)\n"
-                    f"• To: `{target_id[:8]}...` ({len(exchanges)} exchanges)\n"
-                    f"• Loaded {len(exchanges)} exchanges from episodic memory\n"
-                    f"• Ready to continue conversation",
-                    title="Conversation Switched",
-                    border_style="cyan"
+                    result['response'],
+                    title=f"🤖 Assistant [{sidebar_id}]",
+                    border_style="green"
                 ))
-            else:
-                self.error_handler.handle_error(
-                    Exception(f"Could not load conversation '{target_id[:8]}...' from episodic memory"),
-                    ErrorCategory.EPISODIC_MEMORY,
-                    ErrorSeverity.HIGH_DEGRADE,
-                    context=f"Loading conversation {target_id[:8]}",
-                    operation="switch_conversation"
-                )
-                
+
         except Exception as e:
             self.error_handler.handle_error(
                 e,
-                ErrorCategory.EPISODIC_MEMORY,
-                ErrorSeverity.HIGH_DEGRADE,
-                context=f"Switching to conversation {target_id[:8]}",
-                operation="switch_conversation"
+                ErrorCategory.UI_INPUT,
+                ErrorSeverity.MEDIUM_ALERT,
+                context=f"Spawning sidebar: {reason}",
+                operation="spawn_sidebar"
             )
-    
+
+    def merge_current_sidebar(self, summary: Optional[str] = None):
+        """
+        Merge current sidebar back to parent.
+
+        Usage: /merge [optional summary]
+        """
+        try:
+            current_id = self.orchestrator.get_active_context_id()
+            if current_id is None:
+                self.warning_message("No active context", ErrorCategory.UI_INPUT)
+                return
+
+            current = self.orchestrator.get_context(current_id)
+            if current.parent_context_id is None:
+                self.warning_message(
+                    f"{current_id} is a root context - nothing to merge into.\n"
+                    "Use /sidebar to create a sidebar first.",
+                    ErrorCategory.UI_INPUT
+                )
+                return
+
+            result = self.orchestrator.merge_sidebar(current_id, summary=summary)
+
+            if result["success"]:
+                self.console.print(Panel(
+                    f"✅ **Sidebar Merged**\n\n"
+                    f"• Merged: {result['sidebar_id']} → {result['parent_id']}\n"
+                    f"• Exchanges: {result['exchanges_merged']}\n"
+                    f"• Summary: {result['summary']}\n\n"
+                    f"[dim]Now focused on {result['parent_id']}[/dim]",
+                    title="Merge Complete",
+                    border_style="green"
+                ))
+            else:
+                self.warning_message(f"Merge failed: {result.get('error')}", ErrorCategory.UI_INPUT)
+
+        except Exception as e:
+            self.error_handler.handle_error(
+                e,
+                ErrorCategory.UI_INPUT,
+                ErrorSeverity.MEDIUM_ALERT,
+                context="Merging sidebar",
+                operation="merge_current_sidebar"
+            )
+
+    def back_to_parent(self):
+        """
+        Go back to parent context without merging.
+
+        Usage: /back
+        """
+        try:
+            current_id = self.orchestrator.get_active_context_id()
+            if current_id is None:
+                self.warning_message("No active context", ErrorCategory.UI_INPUT)
+                return
+
+            current = self.orchestrator.get_context(current_id)
+            if current.parent_context_id is None:
+                self.warning_message(
+                    f"{current_id} is a root context - no parent to go back to.",
+                    ErrorCategory.UI_INPUT
+                )
+                return
+
+            parent_id = current.parent_context_id
+
+            # Pause current sidebar (not merging, just stepping away)
+            self.orchestrator.pause_context(current_id, reason="User went back to parent")
+
+            # Resume parent
+            self.orchestrator.resume_context(parent_id)
+
+            self.console.print(Panel(
+                f"⬅️ **Back to Parent**\n\n"
+                f"• Left: {current_id} (PAUSED)\n"
+                f"• Now in: {parent_id}\n\n"
+                f"[dim]Sidebar {current_id} is paused. Use /focus {current_id} to return.[/dim]",
+                title="Context Switched",
+                border_style="yellow"
+            ))
+
+        except Exception as e:
+            self.error_handler.handle_error(
+                e,
+                ErrorCategory.UI_INPUT,
+                ErrorSeverity.MEDIUM_ALERT,
+                context="Going back to parent",
+                operation="back_to_parent"
+            )
+
+    def focus_context(self, context_id: str):
+        """
+        Focus on a specific context.
+
+        Usage: /focus <context_id>
+        Example: /focus SB-2
+        """
+        try:
+            if not self.orchestrator.get_context(context_id):
+                self.warning_message(
+                    f"Context '{context_id}' not found.\nUse /tree to see available contexts.",
+                    ErrorCategory.UI_INPUT
+                )
+                return
+
+            old_id = self.orchestrator.get_active_context_id()
+            self.orchestrator.switch_focus(context_id)
+
+            context = self.orchestrator.get_context(context_id)
+            self.console.print(Panel(
+                f"🎯 **Focus Changed**\n\n"
+                f"• From: {old_id}\n"
+                f"• To: {context_id}\n"
+                f"• Status: {context.status.value}\n"
+                f"• Task: {context.task_description or 'No description'}\n"
+                f"• Local exchanges: {len(context.local_memory)}",
+                title="Focus",
+                border_style="blue"
+            ))
+
+        except Exception as e:
+            self.error_handler.handle_error(
+                e,
+                ErrorCategory.UI_INPUT,
+                ErrorSeverity.MEDIUM_ALERT,
+                context=f"Focusing on {context_id}",
+                operation="focus_context"
+            )
+
+    def pause_current_context(self):
+        """
+        Pause the current context.
+
+        Usage: /pause
+        """
+        try:
+            current_id = self.orchestrator.get_active_context_id()
+            if current_id is None:
+                self.warning_message("No active context to pause", ErrorCategory.UI_INPUT)
+                return
+
+            self.orchestrator.pause_context(current_id, reason="User paused")
+
+            self.console.print(Panel(
+                f"⏸️ **Context Paused**\n\n"
+                f"• Context: {current_id}\n"
+                f"• Status: PAUSED\n\n"
+                f"[dim]Use /focus {current_id} to resume[/dim]",
+                title="Paused",
+                border_style="yellow"
+            ))
+
+        except Exception as e:
+            self.error_handler.handle_error(
+                e,
+                ErrorCategory.UI_INPUT,
+                ErrorSeverity.MEDIUM_ALERT,
+                context="Pausing context",
+                operation="pause_current_context"
+            )
+
+    def show_context_tree(self):
+        """
+        Show the context tree.
+
+        Usage: /tree
+        """
+        try:
+            from rich.tree import Tree
+
+            tree_data = self.orchestrator.get_tree()
+            active_id = self.orchestrator.get_active_context_id()
+
+            def build_rich_tree(node: dict, parent_tree: Tree):
+                """Recursively build Rich tree from node data."""
+                node_id = node.get("id", "unknown")
+                desc = node.get("description") or ""
+
+                # Mark active context
+                if node_id == active_id:
+                    label = f"[bold green]{node_id}[/bold green] ← active"
+                else:
+                    # Get status from orchestrator
+                    ctx = self.orchestrator.get_context(node_id)
+                    status = ctx.status.value if ctx else "unknown"
+                    status_color = {
+                        "active": "green",
+                        "paused": "yellow",
+                        "merged": "blue",
+                        "archived": "dim",
+                    }.get(status, "white")
+                    label = f"[{status_color}]{node_id}[/{status_color}] ({status})"
+
+                if desc:
+                    label += f" - {desc[:40]}"
+
+                branch = parent_tree.add(label)
+
+                for child in node.get("children", []):
+                    build_rich_tree(child, branch)
+
+            # Build the tree
+            root_tree = Tree("📊 Context Tree")
+
+            roots = tree_data.get("roots", [])
+            if not roots:
+                self.console.print("[dim]No contexts yet[/dim]")
+                return
+
+            for root in roots:
+                build_rich_tree(root, root_tree)
+
+            self.console.print(root_tree)
+
+            # Show stats
+            stats = self.orchestrator.stats()
+            self.console.print(f"\n[dim]Total: {stats['total_contexts']} contexts | Active: {active_id}[/dim]")
+
+        except Exception as e:
+            self.error_handler.handle_error(
+                e,
+                ErrorCategory.UI_INPUT,
+                ErrorSeverity.LOW_DEBUG,
+                context="Showing context tree",
+                operation="show_context_tree"
+            )
+
     def cleanup_services(self):
         """Clean up auto-started services on exit"""
         # Debug: Show what we have (using warning_message to ensure visibility)
@@ -1112,8 +1212,19 @@ Debug: {'ON' if self.debug_mode else 'OFF'} | Tokens: {'ON' if self.show_tokens 
                     try:
                         process.terminate()
                         self.debug_message(f"Stopped {service} (PID: {process.pid})", ErrorCategory.SERVICE_MANAGEMENT)
-                    except:
-                        pass
+                    except Exception as e:
+                        # Log shutdown failures to learn patterns
+                        # TODO: After observing for weeks/months, adjust severity per service:
+                        # - Critical services (working_memory) = HIGH severity
+                        # - Optional services = LOW severity
+                        # - Algorithmic approach: different failures, different reactions
+                        self.error_handler.handle_error(
+                            e,
+                            ErrorCategory.SERVICE_MANAGEMENT,
+                            ErrorSeverity.MEDIUM_ALERT,
+                            operation="cleanup_service",
+                            context=f"Failed to terminate {service} (PID: {process.pid})"
+                        )
         else:
             self.info_message("No auto-started services to stop", ErrorCategory.SERVICE_MANAGEMENT)
             # Give processes time to terminate gracefully
@@ -1136,266 +1247,23 @@ Debug: {'ON' if self.debug_mode else 'OFF'} | Tokens: {'ON' if self.show_tokens 
             self.run_legacy_ui()
     
     def run_panel_ui(self):
-        """New panel-based UI with better layout management - simplified approach"""
-        # For now, fall back to legacy UI with a note
-        self.console.print(Panel(
-            "[yellow]Panel UI is under development. Using standard UI for now.[/yellow]\n\n"
-            "The panel UI will provide:\n"
-            "• Fixed input area at bottom (solves visibility issue)\n"
-            "• Status bar showing service health\n"
-            "• Side panel for errors\n"
-            "• Better queue management display",
-            title="🚧 Panel UI Preview",
-            border_style="yellow"
-        ))
+        """
+        DEPRECATED: Panel UI with Rich Live display.
 
-        # Use legacy UI for now
+        Why deprecated:
+        - Rich's Live display conflicts with Python's input() - they fight for terminal control
+        - This led to developing the React UI instead (api_server_bridge.py)
+        - React UI is now the primary interface with full panel support
+
+        For CLI enthusiasts:
+        - This method is preserved as a starting point if you want to experiment
+        - The core challenge: Rich Live needs to own the terminal, but input() also needs it
+        - Possible approaches: curses, textual (Rich's TUI framework), or async input handling
+        - Original attempt preserved in: deprecated/DEPRECATED_panel_ui_attempt.py
+
+        Currently just redirects to run_legacy_ui() which uses simple Rich panels + standard input.
+        """
         self.run_legacy_ui()
-        return
-
-        # TODO: Implement proper panel UI
-        # The issue is that Rich's Live display doesn't work well with input()
-        # We need either:
-        # 1. A custom input handler that works with Live
-        # 2. A different approach using alternate screen buffer
-        # 3. Simpler panel updates between prompts
-
-        try:
-                while True:
-                    # Update layout components
-                    self._update_status_bar(layout)
-                    self._update_chat_panel(layout)
-                    self._update_input_panel(layout)
-                    if self.show_error_panel:
-                        self._update_error_panel(layout)
-
-                    # Manual refresh for controlled updates
-                    live.refresh()
-
-                    # Stop live display temporarily for input
-                    live.stop()
-
-                    # Get user input with better handling
-                    try:
-                        import readline
-                        # Show input prompt
-                        self.console.print("[bold blue]You:[/bold blue] ", end="")
-                        user_input = input("")
-
-                        if not user_input:
-                            live.start()
-                            continue
-
-                        # Add to chat history
-                        self.chat_history.append({
-                            'role': 'user',
-                            'content': user_input
-                        })
-
-                        # Handle commands
-                        if user_input.lower() in ['/quit', 'exit']:
-                            self.chat_history.append({
-                                'role': 'system',
-                                'content': "👋 Goodbye!"
-                            })
-                            break
-
-                        # Restart live display
-                        live.start()
-
-                        # Process other commands
-                        result = self._process_command_panel_ui(user_input)
-                        if result:
-                            continue
-
-                        # Process regular chat
-                        self.queue_count += 1
-                        self._update_input_panel(layout)
-                        live.refresh()
-
-                        # Get AI response
-                        response = self.process_message(user_input)
-
-                        self.queue_count = max(0, self.queue_count - 1)
-
-                        # Add response to chat
-                        self.chat_history.append({
-                            'role': 'assistant',
-                            'content': response['response']
-                        })
-
-                        # Keep chat history reasonable size
-                        if len(self.chat_history) > 50:
-                            self.chat_history = self.chat_history[-40:]
-
-                    except KeyboardInterrupt:
-                        self.chat_history.append({
-                            'role': 'system',
-                            'content': "👋 Interrupted - Goodbye!"
-                        })
-                        live.update(layout)
-                        break
-                    except Exception as e:
-                        self.error_handler.handle_error(
-                            e,
-                            ErrorCategory.UI_INPUT,
-                            ErrorSeverity.MEDIUM_ALERT,
-                            context="Panel UI processing"
-                        )
-
-        finally:
-            # Cleanup
-            if hasattr(self, 'recovery_thread') and self.recovery_thread:
-                self.recovery_thread.stop_recovery_thread()
-            if hasattr(self, 'service_processes'):
-                self.cleanup_services()
-
-    def _update_status_bar(self, layout):
-        """Update the status bar with current state"""
-        status_parts = []
-
-        # Service status
-        if self.services_healthy:
-            status_parts.append("[green]● Services OK[/green]")
-        else:
-            status_parts.append("[red]● Services Down[/red]")
-
-        # Model info
-        if hasattr(self.llm, 'model_name'):
-            status_parts.append(f"[cyan]Model: {self.llm.model_name}[/cyan]")
-
-        # Debug mode
-        if self.debug_mode:
-            status_parts.append("[yellow]🐛 Debug ON[/yellow]")
-
-        # Token display
-        if self.show_tokens:
-            status_parts.append("[magenta]🔢 Tokens ON[/magenta]")
-
-        # Error panel
-        if self.show_error_panel:
-            status_parts.append("[orange1]📋 Errors ON[/orange1]")
-
-        # Ball mode
-        if self.fuck_it_we_ball_mode:
-            status_parts.append("[red]🎱 BALL MODE[/red]")
-
-        status_text = " | ".join(status_parts)
-        layout["status"].update(Panel(status_text, style="on grey23", box=box.SIMPLE))
-
-    def _update_chat_panel(self, layout):
-        """Update the chat display panel"""
-        # Format chat history
-        chat_content = []
-        for msg in self.chat_history[-20:]:  # Show last 20 messages
-            if msg['role'] == 'user':
-                chat_content.append(f"[bold blue]You:[/bold blue] {msg['content']}")
-            elif msg['role'] == 'assistant':
-                chat_content.append(f"[bold green]AI:[/bold green] {msg['content']}")
-            elif msg['role'] == 'system':
-                chat_content.append(f"[bold yellow]System:[/bold yellow] {msg['content']}")
-
-        chat_text = "\n\n".join(chat_content) if chat_content else "[dim]No messages yet...[/dim]"
-        layout["chat"].update(Panel(chat_text, title="💬 Chat", border_style="blue"))
-
-    def _update_input_panel(self, layout):
-        """Update the input panel with queue status"""
-        input_content = []
-
-        # Show queue count if any
-        if self.queue_count > 0:
-            input_content.append(f"[yellow]⏳ Queue: {self.queue_count} messages processing...[/yellow]")
-
-        # Show current input prompt
-        input_content.append("[bold blue]You:[/bold blue] _")
-
-        # Add help hint
-        input_content.append("[dim]Type /help for commands | /quit to exit[/dim]")
-
-        input_text = "\n".join(input_content)
-        layout["input"].update(Panel(input_text, title="✍️ Input", border_style="green"))
-
-    def _update_error_panel(self, layout):
-        """Update the error panel if visible"""
-        if not self.show_error_panel:
-            layout["errors"].visible = False
-            return
-
-        layout["errors"].visible = True
-
-        # Get alerts from error handler
-        current_alerts = self.error_handler.peek_alerts_for_ui(max_alerts=8)
-
-        if not current_alerts:
-            error_content = "[dim]No recent errors[/dim]"
-        else:
-            error_content = "\n".join(current_alerts)
-
-        # Add error summary in debug mode
-        if self.debug_mode:
-            error_summary = self.error_handler.get_error_summary()
-            if error_summary['total_errors'] > 0:
-                error_content += f"\n\n[dim]Total: {error_summary['total_errors']} | Suppressed: {error_summary['suppressed_count']}[/dim]"
-
-        layout["errors"].update(Panel(error_content, title="🚨 Errors", border_style="yellow"))
-
-    def _process_command_panel_ui(self, user_input):
-        """Process commands in panel UI mode"""
-        if user_input == '/help':
-            self.chat_history.append({
-                'role': 'system',
-                'content': self._get_help_text()
-            })
-            return True
-
-        if user_input == '/errors':
-            self.toggle_error_panel()
-            self.chat_history.append({
-                'role': 'system',
-                'content': f"Error panel: {'ON' if self.show_error_panel else 'OFF'}"
-            })
-            return True
-
-        if user_input == '/debug':
-            self.debug_mode = not self.debug_mode
-            self.chat_history.append({
-                'role': 'system',
-                'content': f"Debug mode: {'ON' if self.debug_mode else 'OFF'}"
-            })
-            return True
-
-        if user_input == '/tokens':
-            self.show_tokens = not self.show_tokens
-            self.chat_history.append({
-                'role': 'system',
-                'content': f"Token display: {'ON' if self.show_tokens else 'OFF'}"
-            })
-            return True
-
-        if user_input == '/ball':
-            self.toggle_fuck_it_we_ball_mode()
-            return True
-
-        # Add other commands as needed
-        return False
-
-    def _get_help_text(self):
-        """Get help text for panel UI"""
-        return """**Available Commands:**
-
-• `/help` - Show this help
-• `/errors` - Toggle error panel
-• `/debug` - Toggle debug mode
-• `/tokens` - Toggle token display
-• `/ball` - Toggle FUCK IT WE BALL mode
-• `/memory` - Show memory status
-• `/services` - Check service health
-• `/quit` - Exit chat
-
-**Tips:**
-• Error panel shows system alerts
-• Status bar shows current state
-• Queue counter shows pending messages"""
 
     def run_legacy_ui(self):
         """Legacy UI for fallback compatibility"""
@@ -1443,106 +1311,19 @@ Commands: `/help` `/memory` `/history` `/search` `/stats` `/debug` `/new` `/list
                     if not user_input:
                         continue
                     
-                    # Handle commands
+                    # Handle commands via CommandHandler
                     if user_input.lower() in ['/quit', 'exit']:
                         self.console.print("👋 [bold yellow]Goodbye![/bold yellow]")
                         break
-                    
-                    if user_input == '/help':
-                        self.show_help()
-                        continue
-                    
-                    if user_input == '/status':
-                        self.show_status()
-                        continue
-                    
-                    if user_input == '/memory':
-                        self.memory_handler.show_memory()
-                        continue
-                    
-                    if user_input == '/history':
-                        self.memory_handler.show_full_history()
-                        continue
-                    
-                    if user_input.startswith('/search'):
-                        search_term = user_input[7:].strip()  # Remove '/search '
-                        if search_term:
-                            self.memory_handler.search_conversations(search_term)
-                        else:
-                            self.warning_message("Usage: /search <term> - Search your conversation history", ErrorCategory.UI_INPUT)
-                        continue
-                    
-                    if user_input == '/context':
-                        self.show_context_preview()
-                        continue
-                    
-                    if user_input == '/debug':
-                        self.toggle_debug_mode()
-                        continue
-                    
-                    if user_input == '/stats':
-                        self.show_memory_stats()
-                        continue
-                    
-                    if user_input == '/tokens':
-                        self.toggle_token_display()
-                        continue
-                    
-                    if user_input == '/confidence':
-                        self.toggle_confidence_display()
-                        continue
-                    
-                    if user_input == '/new':
-                        self.start_new_conversation()
-                        continue
-                    
-                    if user_input == '/list':
-                        self.list_conversations()
-                        continue
-                    
-                    if user_input.startswith('/switch'):
-                        parts = user_input.split()
-                        if len(parts) > 1:
-                            self.switch_conversation(parts[1])
-                        else:
-                            self.warning_message("Usage: /switch <conversation_id>", ErrorCategory.UI_INPUT)
-                        continue
-                    
-                    if user_input == '/services':
-                        self.check_services()
-                        continue
-                    
-                    if user_input == '/start-services':
-                        self.auto_start_services()
-                        continue
-                    
-                    if user_input == '/stop-services':
-                        # Debug: Direct console output to bypass routing
-                        self.console.print("[red]DEBUG: /stop-services command triggered[/red]")
 
-                        self.cleanup_services()
-                        self.success_message("Services stopped", ErrorCategory.SERVICE_MANAGEMENT)
-                        continue
-                    
-                    # Handle recovery system commands
-                    if user_input.startswith('/recovery'):
-                        if self.recovery_chat:
-                            result = self.recovery_chat.process_command(user_input)
-                            self._display_recovery_result(result)
-                        else:
-                            self.warning_message("Recovery system not available", ErrorCategory.RECOVERY_SYSTEM)
-                        continue
-                    
-                    # Handle FUCK IT WE BALL mode toggle
-                    if user_input == '/ball':
-                        self.toggle_fuck_it_we_ball_mode()
-                        continue
-                    
-                    # Handle error panel toggle (what you originally wanted!)
-                    if user_input == '/errors':
-                        self.toggle_error_panel()
-                        continue
-                    
+                    # Route all commands through CommandHandler
+                    cmd_result = self.command_handler.handle_command(user_input)
+                    if cmd_result.get('handled'):
+                        if cmd_result.get('quit'):
+                            break
+                        if cmd_result.get('should_continue'):
+                            continue
+
                     # Check memory pressure before processing
                     self.check_memory_pressure()
                 
@@ -1604,39 +1385,8 @@ Commands: `/help` `/memory` `/history` `/search` `/stats` `/debug` `/new` `/list
         ))
     
     def _display_recovery_result(self, result: dict):
-        """Display recovery command results with appropriate formatting"""
-        result_type = result.get('type', 'info')
-        title = result.get('title', 'Recovery System')
-        content = result.get('content', str(result))
-        footer = result.get('footer', '')
-        
-        # Choose colors based on result type
-        color_map = {
-            'success': 'green',
-            'error': 'red', 
-            'warning': 'yellow',
-            'info': 'blue',
-            'help': 'cyan',
-            'status': 'blue',
-            'analytics': 'magenta'
-        }
-        
-        border_color = color_map.get(result_type, 'blue')
-        
-        # Format content with footer if present
-        display_content = content
-        if footer:
-            display_content += f"\n\n[dim]{footer}[/dim]"
-        
-        self.console.print(Panel(
-            display_content,
-            title=title,
-            border_style=border_color
-        ))
-        
-        # Show raw result in FIWB mode for debugging
-        if self.fuck_it_we_ball_mode:
-            self.console.print(f"[dim]FIWB: Raw result: {result}[/dim]")
+        """Display recovery command results - delegated to UIHandler"""
+        self.ui_handler.display_recovery_result(result, self.fuck_it_we_ball_mode)
     
     def add_alert_message(self, message: str):
         """Add message to alert queue - now routes through ErrorHandler"""
@@ -1690,36 +1440,13 @@ Commands: `/help` `/memory` `/history` `/search` `/stats` `/debug` `/new` `/list
         self.error_handler._route_error(message, category, ErrorSeverity.TRACE_FIWB)
     
     def display_error_panel_if_enabled(self):
-        """Show simple error panel at bottom if enabled - always show when ON"""
-        if not getattr(self, 'show_error_panel', False):
-            return
-
-        # Get alerts from error handler (reuse the good logic!)
-        current_alerts = self.error_handler.get_alerts_for_ui(max_alerts=5)
-
-        # Always show panel when enabled, even if empty
-        if not current_alerts:
-            alerts_content = "[dim]No recent errors - panel ready for new alerts[/dim]"
-        else:
-            alerts_content = "\n".join(current_alerts)
-            
-        # Add error summary in debug mode
-        if self.debug_mode:
-            error_summary = self.error_handler.get_error_summary()
-            if error_summary['total_errors'] > 0:
-                alerts_content += f"\n\n[dim]Errors: {error_summary['total_errors']} | Suppressed: {error_summary['suppressed_count']}[/dim]"
-                
-        # Add recovery status if available
-        if self.recovery_chat:
-            try:
-                dashboard_status = self.recovery_chat.get_status_for_dashboard()
-                alerts_content = f"{dashboard_status}\n\n{alerts_content}"
-            except:
-                pass
-                
-        # Show simple panel at bottom
-        error_panel = Panel(alerts_content, border_style="yellow", title="🚨 Recent Errors")
-        self.console.print(error_panel)
+        """Show simple error panel at bottom if enabled - delegated to UIHandler"""
+        self.ui_handler.display_error_panel_if_enabled(
+            getattr(self, 'show_error_panel', False),
+            self.error_handler,
+            self.debug_mode,
+            self.recovery_chat
+        )
     
     def toggle_error_panel(self):
         """Toggle error panel on/off - what you originally wanted!"""

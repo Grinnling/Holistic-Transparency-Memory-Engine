@@ -2,7 +2,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Card, CardContent, CardHeader, CardTitle } from './components/ui/card';
 import { Button } from './components/ui/button';
-import { Input } from './components/ui/input';
 import { Badge } from './components/ui/badge';
 import { Textarea } from './components/ui/textarea';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from './components/ui/tabs';
@@ -85,7 +84,7 @@ const App: React.FC = () => {
   // Refs
   const wsRef = useRef<WebSocket | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
-  const inputRef = useRef<HTMLInputElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
 
   // WebSocket connection
   useEffect(() => {
@@ -392,6 +391,17 @@ const App: React.FC = () => {
 
             <TabsContent value="chat" className="flex-1 flex flex-col m-4 mt-2">
               <Card className="flex-1 flex flex-col">
+                <CardHeader className="pb-2">
+                  <CardTitle className="text-lg flex items-center gap-2">
+                    <MessageSquare className="h-5 w-5" />
+                    Conversation
+                    {conversationId && (
+                      <span className="text-xs font-normal text-gray-500 ml-2">
+                        ID: {conversationId.slice(0, 8)}...
+                      </span>
+                    )}
+                  </CardTitle>
+                </CardHeader>
                 <CardContent className="flex-1 flex flex-col p-0">
                   {/* Messages area */}
                   <ScrollArea className="flex-1 p-4">
@@ -454,23 +464,28 @@ const App: React.FC = () => {
 
                   {/* Input area */}
                   <div className="p-4">
-                    <div className="flex gap-2">
-                      <Input
+                    <div className="flex gap-2 items-end">
+                      <Textarea
                         ref={inputRef}
                         value={inputMessage}
                         onChange={(e) => setInputMessage(e.target.value)}
-                        onKeyPress={handleKeyPress}
-                        placeholder={isLoading ? "Processing..." : "Type your message..."}
+                        onKeyDown={handleKeyPress}
+                        placeholder={isLoading ? "Processing..." : "Type your message... (Enter to send, Shift+Enter for new line)"}
                         disabled={isLoading || !isConnected}
-                        className="flex-1"
+                        className="flex-1 min-h-[60px] max-h-[200px] resize-none"
+                        rows={2}
                       />
                       <Button
                         onClick={sendMessage}
                         disabled={isLoading || !isConnected || !inputMessage.trim()}
+                        className="h-[60px]"
                       >
                         <Send className="h-4 w-4" />
                       </Button>
                     </div>
+                    <p className="text-xs text-gray-400 mt-1">
+                      Press Enter to send, Shift+Enter for new line
+                    </p>
                   </div>
                 </CardContent>
               </Card>

@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import '@xterm/xterm/css/xterm.css';
@@ -7,7 +7,10 @@ interface TerminalDisplayProps {
   wsUrl?: string;
 }
 
-export function TerminalDisplay({ wsUrl = 'ws://localhost:8765' }: TerminalDisplayProps) {
+// WebSocket URL from environment, with localhost fallback
+const DEFAULT_TERMINAL_WS = import.meta.env.VITE_TERMINAL_WS_URL || 'ws://localhost:8765';
+
+export function TerminalDisplay({ wsUrl = DEFAULT_TERMINAL_WS }: TerminalDisplayProps) {
   const terminalRef = useRef<HTMLDivElement>(null);
   const xtermRef = useRef<Terminal | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
@@ -26,7 +29,7 @@ export function TerminalDisplay({ wsUrl = 'ws://localhost:8765' }: TerminalDispl
         background: '#1e1e1e',
         foreground: '#d4d4d4',
         cursor: '#ffffff',
-        selection: '#264f78',
+        selectionBackground: '#264f78',
         black: '#000000',
         red: '#cd3131',
         green: '#0dbc79',

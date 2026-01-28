@@ -178,8 +178,8 @@ type WebSocketMessage =
 
 // Message validation helpers
 export const createMessage = <T extends BaseMessage>(
-  type: T['type'], 
-  data: Omit<T, 'id' | 'timestamp' | 'type'>,
+  type: T['type'],
+  data: Omit<T, 'id' | 'timestamp' | 'type' | 'source'>,
   source: BaseMessage['source'] = 'system'
 ): T => {
   return {

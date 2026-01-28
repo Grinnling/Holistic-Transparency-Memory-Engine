@@ -10,7 +10,7 @@ import time
 import signal
 import requests
 import subprocess
-from typing import Dict, Optional, List, Any
+from typing import Dict, Optional, List, Any, Union
 from rich.table import Table
 from rich.console import Console
 from error_handler import ErrorHandler, ErrorCategory, ErrorSeverity
@@ -31,12 +31,13 @@ class ServiceManager:
         self.error_handler = error_handler or ErrorHandler(console=self.console, debug_mode=debug_mode)
         self.debug_mode = debug_mode
 
-        # Service configuration
+        # Service configuration - uses environment variables with localhost defaults
         self.services = {
-            'working_memory': 'http://localhost:5001',
-            'curator': 'http://localhost:8004',
-            'mcp_logger': 'http://localhost:8001',
-            'episodic_memory': 'http://localhost:8005'
+            'working_memory': os.environ.get('WORKING_MEMORY_URL', 'http://localhost:5001'),
+            'curator': os.environ.get('CURATOR_URL', 'http://localhost:8004'),
+            'mcp_logger': os.environ.get('MCP_LOGGER_URL', 'http://localhost:8001'),
+            'episodic_memory': os.environ.get('EPISODIC_MEMORY_URL', 'http://localhost:8005'),
+            'redis': os.environ.get('REDIS_URL', 'tcp://localhost:6379')  # TCP service, not HTTP
         }
 
         # Service process tracking
@@ -51,7 +52,8 @@ class ServiceManager:
             'episodic_memory': ['working_memory'],  # Episodic needs working memory
             'curator': ['working_memory'],          # Curator needs working memory
             'mcp_logger': [],                        # Independent
-            'working_memory': []                     # Independent
+            'working_memory': [],                    # Independent
+            'redis': []                              # Independent (TCP service)
         }
 
         # Service groups for {YOU} - easier management
@@ -109,38 +111,21 @@ class ServiceManager:
         service_status = {}
 
         for service_name, url in self.services.items():
-            try:
-                with self.error_handler.create_context_manager(
-                    ErrorCategory.SERVICE_HEALTH,
-                    ErrorSeverity.LOW_DEBUG,
-                    operation=f"health_check_{service_name}",
-                    context=f"Checking {service_name}"
-                ):
-                    response = requests.get(f"{url}/health", timeout=2)
-                    if response.status_code == 200:
-                        service_status[service_name] = "healthy"
-                        if show_table:
-                            table.add_row(service_name, "✅ Online", url)
-                    else:
-                        service_status[service_name] = "unhealthy"
-                        all_healthy = False
-                        if show_table:
-                            table.add_row(service_name, "❌ Error", f"HTTP {response.status_code}")
-            except Exception as e:
-                service_status[service_name] = "offline"
+            # Use centralized health check (handles HTTP and TCP services like Redis)
+            status = self.check_service_health(service_name)
+            service_status[service_name] = status
+
+            if status == "healthy":
+                if show_table:
+                    table.add_row(service_name, "✅ Online", url)
+            elif status == "unhealthy":
+                all_healthy = False
+                if show_table:
+                    table.add_row(service_name, "❌ Error", "unhealthy response")
+            else:  # offline or unknown
                 all_healthy = False
                 if show_table:
                     table.add_row(service_name, "❌ Offline", url)
-
-                # Log the error but don't spam
-                self.error_handler.handle_error(
-                    e,
-                    ErrorCategory.SERVICE_CONNECTION,
-                    ErrorSeverity.LOW_DEBUG,
-                    context=f"{service_name} health check",
-                    operation="health_check",
-                    suppress_duplicate_minutes=5
-                )
 
         # Add extra services if provided (like LLM, Skinflap)
         if include_extras and show_table:
@@ -152,28 +137,60 @@ class ServiceManager:
 
         return all_healthy
 
-    def check_service_health(self, service_name: str) -> str:
+    def check_service_health(self, service_name: str, include_latency: bool = False) -> Union[str, Dict[str, Any]]:
         """
         Check health of a specific service
 
         Args:
             service_name: Name of the service to check
+            include_latency: If True, return dict with status and latency_ms
 
         Returns:
-            str: 'healthy', 'unhealthy', or 'offline'
+            str: 'healthy', 'unhealthy', or 'offline' (if include_latency=False)
+            dict: {'status': str, 'latency_ms': int} (if include_latency=True)
         """
+        import socket
+
         if service_name not in self.services:
-            return 'unknown'
+            return {'status': 'unknown', 'latency_ms': None} if include_latency else 'unknown'
 
         url = self.services[service_name]
+        latency_ms = None
+
         try:
-            response = requests.get(f"{url}/health", timeout=2)
-            if response.status_code == 200:
-                return 'healthy'
+            start_time = time.time()
+
+            # Handle TCP services (like Redis) differently from HTTP services
+            if url.startswith('tcp://'):
+                # Parse tcp://host:port
+                addr = url.replace('tcp://', '')
+                host, port = addr.split(':')
+                port = int(port)
+
+                # TCP connection check
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(2)
+                result = sock.connect_ex((host, port))
+                sock.close()
+                latency_ms = int((time.time() - start_time) * 1000)
+
+                status = 'healthy' if result == 0 else 'offline'
             else:
-                return 'unhealthy'
+                # HTTP health check
+                response = requests.get(f"{url}/health", timeout=2)
+                latency_ms = int((time.time() - start_time) * 1000)
+
+                if response.status_code == 200:
+                    status = 'healthy'
+                else:
+                    status = 'unhealthy'
         except:
-            return 'offline'
+            status = 'offline'
+            latency_ms = None
+
+        if include_latency:
+            return {'status': status, 'latency_ms': latency_ms}
+        return status
 
     def auto_start_services(self) -> bool:
         """
@@ -185,15 +202,12 @@ class ServiceManager:
         self._info_message("🔍 Checking services...")
         services_to_start = []
 
-        # Check each service
+        # Check each service (use centralized check for TCP/HTTP support)
         for name, url in self.services.items():
-            try:
-                response = requests.get(f"{url}/health", timeout=1)
-                if response.status_code == 200:
-                    self._debug_message(f"✅ {name} already running")
-                else:
-                    services_to_start.append(name)
-            except:
+            status = self.check_service_health(name)
+            if status == 'healthy':
+                self._debug_message(f"✅ {name} already running")
+            else:
                 services_to_start.append(name)
 
         if not services_to_start:
@@ -338,6 +352,67 @@ class ServiceManager:
         self._info_message("Stopping all services...")
         for service in list(self.service_processes.keys()):
             self.stop_service(service)
+
+    def force_stop_all_services(self):
+        """
+        Force stop ALL running services by port, regardless of how they were started
+        Use this for emergency shutdown
+        """
+        self._info_message("Force stopping all services...")
+        stopped_count = 0
+
+        for service_name, service_url in self.services.items():
+            # Extract port from URL
+            port = service_url.split(':')[-1].split('/')[0]
+
+            try:
+                # Find process using this port
+                result = subprocess.run(
+                    ['lsof', '-ti', f':{port}'],
+                    capture_output=True,
+                    text=True
+                )
+
+                if result.returncode == 0 and result.stdout.strip():
+                    pids = result.stdout.strip().split('\n')
+                    killed_pids = []
+                    for pid in pids:
+                        try:
+                            pid_int = int(pid)
+                            self._info_message(f"Killing {service_name} (PID: {pid_int} on port {port})...")
+                            # Try graceful shutdown first
+                            try:
+                                os.kill(pid_int, signal.SIGTERM)
+                                killed_pids.append(pid_int)
+                            except ProcessLookupError:
+                                pass  # Already dead
+                        except (ValueError, PermissionError) as e:
+                            self._warning_message(f"Could not stop {service_name} PID {pid}: {e}", ErrorCategory.SERVICE_MANAGEMENT)
+
+                    # Give processes a moment to die gracefully
+                    if killed_pids:
+                        time.sleep(0.3)
+                        # Force kill any that are still alive
+                        for pid_int in killed_pids:
+                            try:
+                                os.kill(pid_int, signal.SIGKILL)
+                            except (ProcessLookupError, OSError):
+                                pass  # Already dead, that's fine
+                        stopped_count += len(killed_pids)
+                        self._success_message(f"✅ Stopped {service_name} ({len(killed_pids)} process(es))")
+
+            except FileNotFoundError:
+                self._warning_message("lsof command not found - cannot force stop services", ErrorCategory.SERVICE_MANAGEMENT)
+                return False
+            except Exception as e:
+                self._warning_message(f"Error stopping {service_name}: {e}", ErrorCategory.SERVICE_MANAGEMENT)
+
+        if stopped_count > 0:
+            self._success_message(f"Force stopped {stopped_count} service(s)")
+        else:
+            self._info_message("No services were running")
+
+        return stopped_count > 0
 
     def cleanup(self):
         """Clean up resources and stop services"""
@@ -534,14 +609,25 @@ class ServiceManager:
         Get comprehensive service data for {YOU}'s React dashboard
 
         Returns data perfect for the React frontend status panel
+        Frontend expects: status, latency, last_check, error_count
         """
+        from datetime import datetime
         dashboard = {}
+        check_time = datetime.now().isoformat()
+
         for service in self.services:
+            # Get health with latency measurement
+            health_result = self.check_service_health(service, include_latency=True)
             health_data = self.get_service_health_detailed(service)
+
             dashboard[service] = {
-                'status': health_data['status'],
+                # Fields the React frontend expects
+                'status': health_result['status'],
+                'latency': health_result['latency_ms'],
+                'last_check': check_time,
+                'error_count': health_data['restart_attempts'],
+                # Extra useful data
                 'health_score': 100 * (1 - health_data['failure_rate']),
-                'restart_count': health_data['restart_attempts'],
                 'suggestion': health_data['suggested_action'],
                 'dependencies': health_data['dependencies'],
                 'url': self.services[service]
@@ -552,7 +638,7 @@ class ServiceManager:
             'total_services': len(self.services),
             'healthy_count': sum(1 for s in dashboard.values() if isinstance(s, dict) and s.get('status') == 'healthy'),
             'groups': list(self.service_groups.keys()),
-            'last_check': time.strftime('%Y-%m-%d %H:%M:%S')
+            'last_check': check_time
         }
 
         return dashboard
